@@ -147,6 +147,18 @@ that precision drops.
 Attribution of v1 consensi to RM families (chr1 hits): ERV1 74, L1 50,
 MaLR 42, Alu 27, Tigger 17, Charlie 15, ERVL 15, Satellite 15, MIR 11, L2 4.
 
+**Whole-genome run** (k18@8 gap100 + v2 library, w9 seed, score 30; all 24
+chromosomes; 35 min; soft FASTA written): **P 0.937 / R 0.767 / F1 0.844**
+vs RepeatMasker genome-wide. Outputs: `C:\krep_work\chm13_krep.bed`,
+`C:\krep_work\chm13_krep_soft.fa` (3.16 GB), evaluation in
+`genome_eval.txt` / `genome_eval_family.txt`. Union sweep on chr1 showed the
+index adds ~1.5 recall points over the library alone at k18@8; lower index
+thresholds cost more precision than they return.
+
+Note: whole-genome runs launched from this harness as background tasks were
+killed once mid-run; `run_genome.sh` relaunches it detached
+(`setsid nohup`) and polls the log for `ALL_DONE`.
+
 ## What would still move it
 
 - **CR1 / Helitron / Tip100 have no usable consensi** (recall ≈ 0). Their

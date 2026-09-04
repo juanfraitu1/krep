@@ -132,6 +132,44 @@ oldest families because their consensi are the hardest to build (few seeds
 survive at 35% divergence) and their copies are short fragments that clear
 neither the seed chain nor the score floor. The two approaches union.
 
+**Whole genome.** The final configuration — k18 index at threshold 8, gap 100,
+unioned with the v2 library at weight-9 seed and score floor 30 — masks all
+24 chromosomes of T2T-CHM13 in **35 minutes** on a 6-core laptop and writes a
+soft-masked FASTA:
+
+```bash
+krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --index chm13.k18.s16.kidx --index-threshold 8 --graph-gap 100 \
+  --library chm13_consensi_v2.fa --lib-seed 11101001100111 --lib-min-score 30 \
+  --min-len 30 --out chm13_krep.bed --soft chm13_krep_soft.fa
+```
+
+Scored base-by-base against RepeatMasker over the whole genome
+(1,689,365,764 annotated bases):
+
+| | value |
+|---|---|
+| masked | 1,382,100,035 bp (44.3%) |
+| precision | **0.937** |
+| recall | **0.767** |
+| F1 | **0.844** |
+
+| family | recall | | family | recall |
+|---|---|---|---|---|
+| SINE/Alu | 0.993 | | DNA/hAT-Charlie | 0.509 |
+| Retroposon/SVA | 0.992 | | LTR/ERVL | 0.491 |
+| Satellite/centr | 0.998 | | SINE/MIR | 0.330 |
+| LTR/ERVK | 0.962 | | LINE/L2 | 0.146 |
+| Simple_repeat | 0.884 | | LINE/CR1 | 0.022 |
+| LINE/L1 | 0.834 | | RC/Helitron | 0.022 |
+| LTR/ERV1 | 0.793 | | | |
+| LTR/ERVL-MaLR | 0.750 | | | |
+
+The remaining gap to RepeatMasker is concentrated in the oldest families (L2,
+MIR, CR1, Helitron): their consensi are hard to build de novo and their copies
+are short fragments at ~65% identity. Everything younger than ~150 My is
+recovered at 75–99%.
+
 `--index-threshold` is a **genome-wide** occurrence count. It is on a completely
 different scale from the per-slice `--threshold` and must be retuned, not
 carried over: the same family that occurs 5 times in a 10 Mb slice occurs
