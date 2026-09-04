@@ -86,6 +86,52 @@ krep mask --genome chm13_chr1_unmasked.fa \
   --graph-gap 150 --min-hits 2 --min-density 0.03 --out chr1.bed
 ```
 
+### Consensus building and library alignment (for diverged families)
+
+K-mer abundance can only find a copy that still carries high-count k-mers. A
+copy 30% diverged from its family consensus keeps 0.7^18 ≈ 0.16% of them, so
+ancient families (MIR, L2, old L1, DNA transposons) are invisible at any
+threshold. RepeatMasker sidesteps this by aligning each copy to a *consensus*,
+which is far closer to every copy than copies are to each other. krep can now
+do the same without a curated library:
+
+```bash
+# Build family consensi de novo from the index's abundant k-mers
+# (RepeatScout-style greedy extension; writes a plain sequence dump once)
+krep consensus --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --index chm13.k18.s16.kidx --seq-dump chm13.kseq \
+  --min-seed-count 50 --max-families 3000 --out chm13_consensi.fa
+
+# Align the consensi back and mask hits; --index and --library union
+krep mask --genome chm13_chr1_unmasked.fa --library chm13_consensi.fa \
+  --index chm13.k18.s16.kidx --index-threshold 4 --graph-gap 150 --out chr1.bed
+```
+
+Library hits carry the consensus id and alignment score in BED column 4.
+
+On a 10 Mb mock genome with copies 15% diverged, library masking alone reaches
+P 0.998 / R 0.949 / F1 0.973 (ALU 0.995, LINE1 0.999, LTR 0.997, SINE 0.991),
+where k-mer masking alone gets F1 0.48. At 25% divergence it recovers 93% of
+ALU copies where k-mer masking recovers 9%.
+
+On T2T-CHM13, `krep consensus` over the whole genome (min seed count 30) built
+**1,124 consensi** (2.45 Mb, median 950 bp, longest 6,018 bp — a full L1) in
+~30 min. Masking chr1 with that library alone, weight-9 seed and score floor 30,
+scores **P 0.959 / R 0.742 / F1 0.836** against RepeatMasker — past the 0.775
+ceiling of every k-mer configuration, at higher precision. Per family:
+
+| family | k-mer best | library v2 | | family | k-mer best | library v2 |
+|---|---|---|---|---|---|---|
+| LINE/L1 | 0.888 | 0.819 | | DNA/hAT-Charlie | 0.593 | 0.491 |
+| LTR/ERVK | 0.969 | 0.954 | | SINE/MIR | 0.468 | 0.334 |
+| LTR/ERV1 | 0.802 | 0.769 | | LINE/L2 | 0.309 | 0.138 |
+| LTR/ERVL | 0.426 | 0.503 | | LINE/CR1 | 0.232 | 0.009 |
+
+The library wins on precision and on ERVL; the k-mer path still wins on the
+oldest families because their consensi are the hardest to build (few seeds
+survive at 35% divergence) and their copies are short fragments that clear
+neither the seed chain nor the score floor. The two approaches union.
+
 `--index-threshold` is a **genome-wide** occurrence count. It is on a completely
 different scale from the per-slice `--threshold` and must be retuned, not
 carried over: the same family that occurs 5 times in a 10 Mb slice occurs
@@ -192,6 +238,10 @@ Repeat families in the mock genome: ALU, LINE1, SINE, LTR, MICROSAT, SAT, **SEG_
 | `--index-threshold-low` | = high | Lower count at which a seed may *extend or bridge* a region a stronger seed nucleated (hysteresis). Weak seeds never start a region |
 | `--min-hits` | `1` | Minimum seed hits in a linked component |
 | `--min-density` | `0` | Minimum hits per base over a linked component. With dense sampling, real copies sit well above 0.1; background clusters do not |
+| `--library` | — | Consensus FASTA (from `krep consensus`, or any repeat library). Consensi are seeded with a weight-11 spaced seed on both strands; two hits on one diagonal trigger a banded X-drop alignment, and hits at or above `--lib-min-score` are masked. Unions with `--index` |
+| `--lib-min-score` | `50` | Minimum alignment score (match +1, mismatch −1, gap −3) |
+| `--lib-band` | `16` | Alignment band half-width |
+| `--lib-xdrop` | `40` | Stop extending once the score falls this far below its best |
 
 ### `index`
 
@@ -213,6 +263,46 @@ against it.
 
 The command prints an occurrence-count histogram, which is the practical way to
 pick `--index-threshold`.
+
+### `consensus`
+
+Build de novo repeat consensi (RepeatScout-style) from a contiguous k-mer
+index. Seeds are taken most-abundant first; for each seed not already inside a
+built consensus, up to `--max-occ` genomic occurrences are fetched, oriented by
+strand, and the consensus is grown one base at a time by a banded
+fit-alignment DP over all occurrences. Lanes are split into voters (choose the
+base) and held-out judges (decide whether the total improved), which keeps the
+extension from fitting noise; growth stops after `--lookahead` steps without
+improvement. Consensi are filtered for length, support, tandem periodicity and
+redundancy.
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--genome` | – | input FASTA (the whole genome) |
+| `--index` | – | contiguous k-mer index (no `--seed`) for picking seeds |
+| `--seq-dump` | `genome.kseq` | plain sequence dump for random access; created once, reused |
+| `--min-seed-count` | 20 | only k-mers this frequent become seeds |
+| `--max-families` | 2000 | stop after this many consensi |
+| `--max-occ` | 100 | occurrences sampled per seed |
+| `--flank` | 3000 | bases fetched on each side of a seed; caps consensus length |
+| `--band` | 16 | alignment band half-width (tolerated net indel drift) |
+| `--lookahead` | 100 | stop after this many steps without score improvement |
+| `--min-len` | 50 | discard shorter consensi |
+| `--min-support` | 10 | discard consensi with fewer copies fitting at ~62% identity |
+| `--out` | `consensi.fa` | output FASTA |
+
+Scoring is match +1 / mismatch −1 / gap −3. Two details decide whether this
+works at all. The gap cost: at −2 a diagonal switch costs the same as a
+mismatch and the DP drifts *upward* through random sequence (the linear phase
+of alignment statistics), so extension never stops. And the voter/judge split:
+choosing each base by plurality over the same lanes that score the step lets
+the consensus fit noise — with few lanes the total creeps up through random
+tails — so a third of the lanes are held out purely to judge improvement.
+
+Seeds are checked against the Hamming-2 neighbourhood of every k-mer in
+already-built consensi before extension; without that, subfamily seeds (one
+or two mismatches from a consensus already built) rebuild the same family
+thousands of times and the run never reaches low-count seeds.
 
 ### `demask`
 

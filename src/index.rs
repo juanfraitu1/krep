@@ -508,6 +508,11 @@ impl KmerIndex {
         })
     }
 
+    /// Iterate (seed, count) entries in ascending seed order.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        self.kmers.iter().copied().zip(self.counts.iter().copied())
+    }
+
     /// Window length in bases covered by one seed.
     pub fn span(&self) -> usize {
         self.seed.span()

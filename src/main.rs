@@ -1,5 +1,7 @@
+mod align;
 mod bitvec;
 mod cbf;
+mod consensus;
 mod evaluate;
 mod fasta;
 mod index;
@@ -171,6 +173,31 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         min_density: f64,
 
+        /// Consensus library FASTA (from `krep consensus`, or any repeat
+        /// library). Every consensus is aligned to the genome and hits are
+        /// masked; combine with --index to union both approaches.
+        #[arg(long, value_name = "FASTA")]
+        library: Option<PathBuf>,
+
+        /// Minimum alignment score (match +1, mismatch -1, gap -3) for a
+        /// library hit to be masked.
+        #[arg(long, default_value_t = 50)]
+        lib_min_score: i32,
+
+        /// Alignment band half-width for library hits.
+        #[arg(long, default_value_t = 16)]
+        lib_band: usize,
+
+        /// X-drop: stop extending once the score falls this far below its best.
+        #[arg(long, default_value_t = 40)]
+        lib_xdrop: i32,
+
+        /// Spaced seed used to find library hits (weight 8-13; need not be
+        /// symmetric). Lower weight is more sensitive to diverged copies at
+        /// the cost of more spurious chains.
+        #[arg(long, default_value = "111010010100110111")]
+        lib_seed: String,
+
         /// Counting Bloom filter size multiplier: number of CBF slots is
         /// `factor × number_of_kmers`. Lower values reduce memory but increase
         /// hash collisions. Default 8; try 4 on memory-constrained laptops.
@@ -236,6 +263,68 @@ enum Commands {
         out: PathBuf,
 
         /// Print per-record progress while counting.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+
+    /// Build de novo repeat consensus sequences (RepeatScout-style) from a
+    /// genome-wide index, for use with `krep mask --library`.
+    ///
+    /// K-mer abundance misses copies that no longer carry high-count k-mers;
+    /// aligning each copy to its family consensus does not. This grows a
+    /// consensus outward from each abundant seed by greedy extension over the
+    /// seed's genomic occurrences.
+    Consensus {
+        /// Input FASTA (the whole genome).
+        #[arg(short, long)]
+        genome: PathBuf,
+
+        /// Contiguous k-mer index from `krep index` (no --seed), used to pick
+        /// abundant seeds.
+        #[arg(long)]
+        index: PathBuf,
+
+        /// Plain sequence dump for random access; created on first use and
+        /// reused afterwards. Size equals the genome.
+        #[arg(long, default_value = "genome.kseq")]
+        seq_dump: PathBuf,
+
+        /// Only k-mers at least this frequent genome-wide become seeds.
+        #[arg(long, default_value_t = 20)]
+        min_seed_count: u32,
+
+        /// Stop after this many consensi.
+        #[arg(long, default_value_t = 2000)]
+        max_families: usize,
+
+        /// Occurrences sampled per seed to build its consensus.
+        #[arg(long, default_value_t = 100)]
+        max_occ: usize,
+
+        /// Bases fetched on each side of a seed; caps consensus length.
+        #[arg(long, default_value_t = 3000)]
+        flank: usize,
+
+        /// Half-width of the alignment band (tolerated net indel drift).
+        #[arg(long, default_value_t = 16)]
+        band: usize,
+
+        /// Stop extending after this many steps without score improvement.
+        #[arg(long, default_value_t = 100)]
+        lookahead: usize,
+
+        /// Discard consensi shorter than this.
+        #[arg(long, default_value_t = 50)]
+        min_len: usize,
+
+        /// Discard consensi supported by fewer copies at ~62% identity.
+        #[arg(long, default_value_t = 10)]
+        min_support: usize,
+
+        /// Output consensus FASTA.
+        #[arg(short, long, default_value = "consensi.fa")]
+        out: PathBuf,
+
         #[arg(long, default_value_t = false)]
         verbose: bool,
     },
@@ -424,13 +513,18 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         index_threshold_low,
         min_hits,
         min_density,
+        library,
+        lib_min_score,
+        lib_band,
+        lib_xdrop,
+        lib_seed,
     } = args
     else {
         unreachable!()
     };
 
-    // Index-driven path: stream the target, look up genome-wide counts.
-    if !index_paths.is_empty() {
+    // Streaming path: genome-wide index lookups and/or library alignment.
+    if !index_paths.is_empty() || library.is_some() {
         let broadcast = |v: &Vec<u32>, name: &str| -> Result<Vec<u32>, String> {
             match v.len() {
                 1 => Ok(vec![v[0]; index_paths.len()]),
@@ -443,10 +537,14 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                 )),
             }
         };
-        let highs = broadcast(index_threshold, "--index-threshold")?;
+        let lib = match library {
+            Some(p) => Some(align::Library::load_with_seed(p, lib_seed, *lib_min_score, *lib_band, *lib_xdrop)?),
+            None => None,
+        };
+        let highs = if index_paths.is_empty() { Vec::new() } else { broadcast(index_threshold, "--index-threshold")? };
         let lows = match index_threshold_low {
-            Some(v) => broadcast(v, "--index-threshold-low")?,
-            None => highs.clone(),
+            Some(v) if !index_paths.is_empty() => broadcast(v, "--index-threshold-low")?,
+            _ => highs.clone(),
         };
         let thresholds: Vec<(u32, u32)> = highs.into_iter().zip(lows).collect();
         return run_mask_indexed(
@@ -457,6 +555,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             *min_len,
             *min_hits,
             *min_density,
+            lib.as_ref(),
             out,
             out_format,
             soft.as_deref(),
@@ -942,6 +1041,7 @@ fn run_mask_indexed(
     min_len: usize,
     min_hits: usize,
     min_density: f64,
+    library: Option<&align::Library>,
     out: &PathBuf,
     out_format: &OutputFormat,
     soft: Option<&std::path::Path>,
@@ -984,6 +1084,17 @@ fn run_mask_indexed(
         }
         indices.push(idx);
     }
+    if let Some(lib) = library {
+        println!(
+            "Loaded library: {} consensi, {} bp, {} seeded positions; min score {}, band {}, x-drop {}",
+            lib.len(),
+            lib.total_bases(),
+            lib.seeded_positions(),
+            lib.min_score,
+            lib.band,
+            lib.xdrop
+        );
+    }
 
     let mut stream = fasta::FastaStream::open(genome)?;
     let mut soft_writer = match soft {
@@ -996,10 +1107,18 @@ fn run_mask_indexed(
     let mut total_masked = 0u64;
 
     while let Some(mut rec) = stream.next_record(true)? {
-        let regions = mask::mask_sequence_indexed(
-            &rec.header, &rec.seq, &indices, thresholds, max_gap, min_len, min_hits,
-            min_density,
-        );
+        let mut regions = if indices.is_empty() {
+            Vec::new()
+        } else {
+            mask::mask_sequence_indexed(
+                &rec.header, &rec.seq, &indices, thresholds, max_gap, min_len, min_hits,
+                min_density,
+            )
+        };
+        if let Some(lib) = library {
+            regions.extend(lib.mask_record(&rec.header, &rec.seq));
+            align::merge_regions(&mut regions);
+        }
         let masked: usize = regions.iter().map(|r| r.end - r.start).sum();
         println!(
             "  {:<18} {:>12} bp  {:>8} regions  {:>6.2}% masked",
@@ -1039,11 +1158,70 @@ fn run_mask_indexed(
     Ok(())
 }
 
+fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+    let Commands::Consensus {
+        genome,
+        index: index_path,
+        seq_dump,
+        min_seed_count,
+        max_families,
+        max_occ,
+        flank,
+        band,
+        lookahead,
+        min_len,
+        min_support,
+        out,
+        verbose,
+    } = args
+    else {
+        unreachable!()
+    };
+    let t0 = Instant::now();
+    let idx = index::KmerIndex::load(index_path)?;
+    println!(
+        "Loaded index: k={}, {} entries. Building consensi (min seed count {}, max {} families) ...",
+        idx.span(),
+        idx.len(),
+        min_seed_count,
+        max_families
+    );
+    let params = consensus::Params {
+        min_seed_count: *min_seed_count,
+        max_families: *max_families,
+        max_occ: *max_occ,
+        flank: *flank,
+        band: *band,
+        lookahead: *lookahead,
+        min_len: *min_len,
+        min_support: *min_support,
+        verbose: *verbose,
+    };
+    let lib = consensus::build_library(&idx, genome, seq_dump, &params)?;
+    consensus::write_library(&lib, out)?;
+    let total: usize = lib.iter().map(|c| c.seq.len()).sum();
+    println!(
+        "Wrote {} consensi ({} bp total, median length {}) to {} in {:.1}s",
+        lib.len(),
+        total,
+        {
+            let mut l: Vec<usize> = lib.iter().map(|c| c.seq.len()).collect();
+            l.sort_unstable();
+            l.get(l.len() / 2).copied().unwrap_or(0)
+        },
+        out.display(),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
         cmd @ Commands::Mock { .. } => run_mock(cmd),
         cmd @ Commands::Index { .. } => run_index(cmd),
+        cmd @ Commands::Consensus { .. } => run_consensus(cmd),
         cmd @ Commands::Mask { .. } => run_mask(cmd),
         cmd @ Commands::Demask { .. } => run_demask(cmd),
         cmd @ Commands::CompareMask { .. } => run_compare_mask(cmd),

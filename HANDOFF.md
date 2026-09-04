@@ -108,7 +108,62 @@ Everything converges at F1 ≈ 0.775. That is the de novo copy-vs-copy ceiling
 here; the remaining ~20% of RepeatMasker's bases are copies that share no seed
 with any other copy at a usable weight.
 
-## What would actually move the ceiling
+## Round 3: de novo consensus + library alignment (C1) — built and measured
+
+- `src/consensus.rs` — `krep consensus`: RepeatScout-style greedy extension
+  from index seeds. Sequence dump (`--seq-dump`, 3.1 GB, reused) + one
+  occurrence pass, then per seed: fetch ≤100 windows, orient, extend right and
+  left with a banded fit DP (match +1 / mismatch −1 / gap −3, band 16), stop
+  after 100 non-improving steps, filter (len ≥ 50, support ≥ 10 at ~62%
+  identity, not tandem, not ≥60% 12-mer-redundant).
+- `src/align.rs` — `krep mask --library`: consensi seeded on both strands into
+  a direct-address table (4^weight), genome scanned forward, two hits on one
+  diagonal per consensus trigger an ungapped check then banded X-drop
+  extension both ways; hits ≥ `--lib-min-score` masked, seeds inside masked
+  regions skipped. `--lib-seed` (weight 8–13), `--lib-band`, `--lib-xdrop`.
+  BED column 4 = `consensus:score`. Unions with `--index`.
+
+Bugs that had to be found before any of it worked (all covered by tests now):
+1. Gap cost 2 → alignment in the *linear phase*: the max over a band of
+   near-free paths drifts upward through random sequence; extension never
+   stopped. Gap 3 fixes it.
+2. Base chosen by plurality over the same lanes that score the step → with
+   few lanes the consensus fits noise. Held-out judges (every 3rd lane) fix it.
+3. Exact "seed already covered" check misses subfamily seeds → 9,655 redundant
+   rebuilds and the run stopped at seed count 208. Hamming-2 check: 173k seeds
+   skipped cheaply, run reaches count 30, 1,124 consensi instead of 380.
+4. Aligner chain buffer scanned linearly per table entry → ~3e12 comparisons
+   on chr1 at weight 9. Replaced by two slots per oriented consensus (O(1)).
+5. Failed extensions left their anchor in the buffer and re-triggered at every
+   following position; reversed slices were allocated per extension. Fixed,
+   plus an ungapped diagonal check before the banded DP.
+
+Results (chr1 vs RepeatMasker): mock 15% divergence library-only F1 0.973;
+mock 25% ALU recall 0.93 (k-mer: 0.09). Real genome, v2 library, weight-9 seed,
+score 30: **P 0.959 / R 0.742 / F1 0.836** library-only. Sensitivity knee:
+weight 10/score 20 and weight 9/score 30 both ≈0.80 on the v1 library; below
+that precision drops.
+
+Attribution of v1 consensi to RM families (chr1 hits): ERV1 74, L1 50,
+MaLR 42, Alu 27, Tigger 17, Charlie 15, ERVL 15, Satellite 15, MIR 11, L2 4.
+
+## What would still move it
+
+- **CR1 / Helitron / Tip100 have no usable consensi** (recall ≈ 0). Their
+  seeds sit below count 30 or their copies are too short/diverged for the
+  extension to gather support. Options: lower `--min-seed-count` with a
+  longer run; seed from the spaced-seed index instead of contiguous 18-mers.
+- **Short diverged fragments** (MIR/L2 at ~150 bp, 65% identity) barely clear
+  the 2-hit chain and the score floor. A length-normalized score threshold or
+  single-hit triggering for consensi < 400 bp would help sensitivity at a
+  measurable precision cost.
+- **Subfamily consensi**: the redundancy filter drops candidates sharing ≥60%
+  12-mers; RepeatModeler keeps subfamilies. Loosening it to ~85% would add
+  AluY/AluS-style variants and lift young-family recall slightly.
+- Whole-genome library run + genome-wide evaluation (BEDs are in
+  `C:\krep_work\genome_rm.bed` / `genome_rm_family.bed`).
+
+## What would actually move the ceiling (earlier notes)
 
 1. **Consensus + alignment (RepeatScout-style).** Seed from high-count entries
    in the index, gather occurrences with flanks, extend a consensus by majority
@@ -130,6 +185,10 @@ with any other copy at a usable weight.
 - Genome indices: `C:\krep_work\chm13.k18.s16.kidx` (contiguous 18-mer,
   1/16 sampled, 235 MB) and `C:\krep_work\chm13.sp16.s1.kidx` (spaced
   w16/s22, dense, 560 MB)
+- Consensus libraries: `C:\krep_work\chm13_consensi_v2.fa` (1,124 consensi;
+  use this), `chm13_consensi.fa` (v1, 380). Sequence dump
+  `C:\krep_work\chm13.kseq` (3.1 GB, reused by `krep consensus`).
+- Mock genomes for regression: `C:\krep_work\mock15.*`, `mock25.*`.
 - RepeatMasker BED: `C:\krep_work\chr1_rm.bed` (merged),
   `C:\krep_work\chr1_rm_family.bed` (4-column, for per-family recall)
 - Raw annotation: `~/krep_data/rm.out.gz` (from NCBI FTP, 198 MB)

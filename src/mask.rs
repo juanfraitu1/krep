@@ -17,6 +17,8 @@ pub struct MaskedRegion {
     pub chrom: String,
     pub start: usize,
     pub end: usize,
+    /// Family label for library hits ("consensus:score"); empty otherwise.
+    pub name: String,
 }
 
 #[allow(dead_code)]
@@ -333,6 +335,7 @@ pub fn mask_sequence(
                 chrom: crate::fasta::seq_id(chrom).to_string(),
                 start,
                 end,
+                name: String::new(),
             });
         }
     }
@@ -396,6 +399,7 @@ pub fn mask_fasta_union(
                     chrom: crate::fasta::seq_id(header).to_string(),
                     start,
                     end,
+                name: String::new(),
                 });
             }
         }
@@ -477,6 +481,7 @@ pub fn mask_fasta_graph(
                     chrom: crate::fasta::seq_id(header).to_string(),
                     start,
                     end,
+                name: String::new(),
                 });
             }
         }
@@ -605,6 +610,7 @@ pub fn mask_fasta_assembly(
                     chrom: crate::fasta::seq_id(header).to_string(),
                     start,
                     end,
+                name: String::new(),
                 });
             }
         }
@@ -616,8 +622,14 @@ pub fn mask_fasta_assembly(
 pub fn regions_to_bed(regions: &[MaskedRegion]) -> String {
     let mut s = String::new();
     use std::fmt::Write as _;
+    let named = regions.iter().any(|r| !r.name.is_empty());
     for r in regions {
-        writeln!(s, "{}\t{}\t{}", r.chrom, r.start, r.end).unwrap();
+        if named {
+            let n = if r.name.is_empty() { "." } else { r.name.as_str() };
+            writeln!(s, "{}\t{}\t{}\t{}", r.chrom, r.start, r.end, n).unwrap();
+        } else {
+            writeln!(s, "{}\t{}\t{}", r.chrom, r.start, r.end).unwrap();
+        }
     }
     s
 }
@@ -812,6 +824,7 @@ pub fn mask_sequence_indexed(
                 chrom: chrom_id.to_string(),
                 start: s,
                 end: e,
+                name: String::new(),
             });
         }
     };

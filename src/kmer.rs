@@ -132,8 +132,25 @@ pub struct SpacedSeed {
 }
 
 impl SpacedSeed {
-    /// Parse a pattern such as `11011011011011011011`.
+    /// Parse a pattern such as `11011011011011011011`. The pattern must be
+    /// symmetric, which is what makes canonical (strand-independent) seed
+    /// values exact; use [`SpacedSeed::parse_any`] when both strands are
+    /// handled explicitly instead.
     pub fn parse(pattern: &str) -> Result<Self, String> {
+        let seed = Self::parse_any(pattern)?;
+        if seed.pattern.bytes().ne(seed.pattern.bytes().rev()) {
+            return Err(format!(
+                "seed pattern must be symmetric so reverse-complement canonicalization is exact (got {})",
+                seed.pattern
+            ));
+        }
+        Ok(seed)
+    }
+
+    /// Parse a pattern without requiring symmetry. Only valid where the caller
+    /// never canonicalizes seed values — e.g. a library aligner that indexes
+    /// both strands of every consensus and scans the genome forward only.
+    pub fn parse_any(pattern: &str) -> Result<Self, String> {
         let pattern = pattern.trim();
         if pattern.is_empty() || !pattern.bytes().all(|b| b == b'0' || b == b'1') {
             return Err(format!("seed pattern must be a string of 0/1, got {:?}", pattern));
@@ -148,12 +165,6 @@ impl SpacedSeed {
         }
         if !pattern.starts_with('1') || !pattern.ends_with('1') {
             return Err("seed pattern must start and end with 1".into());
-        }
-        if pattern.bytes().ne(pattern.bytes().rev()) {
-            return Err(format!(
-                "seed pattern must be symmetric so reverse-complement canonicalization is exact (got {})",
-                pattern
-            ));
         }
 
         // Base i of the pattern (0 = leftmost = oldest) lives at bit offset
