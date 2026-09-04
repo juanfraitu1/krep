@@ -330,7 +330,7 @@ pub fn mask_sequence(
     for (start, end) in covered.set_runs() {
         if end - start >= min_len {
             regions.push(MaskedRegion {
-                chrom: chrom.to_string(),
+                chrom: crate::fasta::seq_id(chrom).to_string(),
                 start,
                 end,
             });
@@ -393,7 +393,7 @@ pub fn mask_fasta_union(
         for (start, end) in covered.set_runs() {
             if end - start >= min_len {
                 all.push(MaskedRegion {
-                    chrom: header.clone(),
+                    chrom: crate::fasta::seq_id(header).to_string(),
                     start,
                     end,
                 });
@@ -474,7 +474,7 @@ pub fn mask_fasta_graph(
         for (start, end) in covered.set_runs() {
             if end - start >= min_len {
                 all.push(MaskedRegion {
-                    chrom: header.clone(),
+                    chrom: crate::fasta::seq_id(header).to_string(),
                     start,
                     end,
                 });
@@ -602,7 +602,7 @@ pub fn mask_fasta_assembly(
         for (start, end) in covered.set_runs() {
             if end - start >= min_len {
                 all.push(MaskedRegion {
-                    chrom: header.clone(),
+                    chrom: crate::fasta::seq_id(header).to_string(),
                     start,
                     end,
                 });
@@ -672,5 +672,105 @@ mod tests {
     fn too_short_for_window() {
         let regions = mask_sequence("chr1", b"ACGTACGTACGT", 31, 3, 100, 0.5, 50, 0, 8);
         assert!(regions.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index-driven masking
+// ---------------------------------------------------------------------------
+
+/// Mask one record using **genome-wide** k-mer counts from a prebuilt index.
+///
+/// This is the counterpart to `mask_fasta_graph`, with one crucial difference:
+/// the abundance of every k-mer was measured across the entire genome rather
+/// than across whichever record happens to be in memory. A family with a few
+/// hundred copies genome-wide is therefore visible even when the target is a
+/// single chromosome or a 10 Mb slice.
+///
+/// Because the index only stores a hash sample of k-mer space, seeds are sparse
+/// (roughly one per `sample` bases inside a repeat). `max_gap` links them back
+/// into contiguous blocks, so it must comfortably exceed the sampling stride.
+pub fn mask_sequence_indexed(
+    chrom: &str,
+    seq: &[u8],
+    idx: &crate::index::KmerIndex,
+    threshold: u32,
+    max_gap: usize,
+    min_len: usize,
+) -> Vec<MaskedRegion> {
+    let k = idx.k;
+    let n_starts = seq.len().saturating_sub(k.saturating_sub(1));
+    if n_starts == 0 {
+        return Vec::new();
+    }
+
+    // Disjoint k-mer start ranges, so every position is tested exactly once.
+    let block = (n_starts.div_ceil(rayon::current_num_threads().max(1))).max(1 << 20);
+    let mut bounds = Vec::new();
+    let mut b = 0usize;
+    while b < n_starts {
+        bounds.push((b, (b + block).min(n_starts)));
+        b += block;
+    }
+
+    let parts: Vec<Vec<u32>> = bounds
+        .into_par_iter()
+        .map(|(bs, be)| {
+            let hi = (be + k - 1).min(seq.len());
+            let mut hits = Vec::new();
+            for (pos, kmer) in KmerIter::new(&seq[bs..hi], k) {
+                if idx.sampled(kmer) && idx.count(kmer) >= threshold {
+                    hits.push((bs + pos) as u32);
+                }
+            }
+            hits
+        })
+        .collect();
+
+    let mut positions: Vec<u32> = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
+    for p in parts {
+        positions.extend_from_slice(&p);
+    }
+    if positions.is_empty() {
+        return Vec::new();
+    }
+
+    // Blocks are emitted in ascending order and are disjoint, so `positions` is
+    // already sorted; this is a cheap guard rather than a real sort.
+    debug_assert!(positions.windows(2).all(|w| w[0] <= w[1]));
+
+    let mut regions = Vec::new();
+    let mut comp_start = positions[0] as usize;
+    let mut comp_last = positions[0] as usize;
+    let mut push = |s: usize, last: usize, out: &mut Vec<MaskedRegion>| {
+        let e = (last + k).min(seq.len());
+        if e - s >= min_len {
+            out.push(MaskedRegion {
+                chrom: crate::fasta::seq_id(chrom).to_string(),
+                start: s,
+                end: e,
+            });
+        }
+    };
+    for &pos in positions.iter().skip(1) {
+        let pos = pos as usize;
+        if pos > comp_last + max_gap {
+            push(comp_start, comp_last, &mut regions);
+            comp_start = pos;
+        }
+        comp_last = pos;
+    }
+    push(comp_start, comp_last, &mut regions);
+
+    regions
+}
+
+/// Soft-mask a sequence in place from regions belonging to this record.
+pub fn apply_soft_mask(seq: &mut [u8], regions: &[MaskedRegion]) {
+    let len = seq.len();
+    for r in regions {
+        for b in &mut seq[r.start.min(len)..r.end.min(len)] {
+            b.make_ascii_lowercase();
+        }
     }
 }

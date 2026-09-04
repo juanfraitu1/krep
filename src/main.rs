@@ -2,6 +2,7 @@ mod bitvec;
 mod cbf;
 mod evaluate;
 mod fasta;
+mod index;
 mod kmer;
 mod mask;
 mod mock;
@@ -133,11 +134,70 @@ enum Commands {
         #[arg(long, value_name = "COUNT", default_value_t = 0)]
         assembly_abundance: u64,
 
+        /// Use a prebuilt genome-wide index (see `krep index`) instead of
+        /// counting k-mers within the input FASTA. `k` comes from the index;
+        /// `--threshold` is then a genome-wide occurrence count, which is a
+        /// completely different scale from the per-slice counts, so it must be
+        /// retuned rather than carried over.
+        #[arg(long, value_name = "FILE")]
+        index: Option<PathBuf>,
+
+        /// Genome-wide occurrence threshold used with `--index`.
+        #[arg(long, default_value_t = 10)]
+        index_threshold: u32,
+
         /// Counting Bloom filter size multiplier: number of CBF slots is
         /// `factor × number_of_kmers`. Lower values reduce memory but increase
         /// hash collisions. Default 8; try 4 on memory-constrained laptops.
         #[arg(long, value_name = "FACTOR", default_value_t = 8)]
         cbf_factor: usize,
+    },
+
+    /// Build a genome-wide k-mer count index.
+    ///
+    /// Run this once over the full genome, then mask any subset against it.
+    /// Counting genome-wide is the whole point: a repeat family with a few
+    /// hundred copies genome-wide has an expected count below 1 inside a 10 Mb
+    /// window, so per-slice counting cannot see it at all.
+    Index {
+        /// Input FASTA (the whole genome).
+        #[arg(short, long)]
+        genome: PathBuf,
+
+        /// k-mer length. At genome scale k must be large enough that a random
+        /// k-mer is not expected to recur by chance (k >= 17 for 3.1 Gb).
+        #[arg(short, long, default_value_t = 18)]
+        k: usize,
+
+        /// Keep 1 in SAMPLE k-mers, chosen by hash. Must be a power of two.
+        /// Sampling shrinks the table without biasing counts: a sampled k-mer
+        /// is counted at every occurrence, so stored counts stay exact.
+        #[arg(long, default_value_t = 16)]
+        sample: u64,
+
+        /// Drop k-mers occurring fewer than this many times genome-wide.
+        /// Singletons dominate the table; discarding them is what makes the
+        /// index loadable on a small machine.
+        #[arg(long, default_value_t = 2)]
+        min_count: u32,
+
+        /// K-mers buffered in RAM before spilling a sorted run to disk.
+        /// Each buffered k-mer costs 8 bytes, so 48M ~ 384 MB.
+        #[arg(long, default_value_t = 48_000_000)]
+        buffer: usize,
+
+        /// Directory for temporary sorted runs. Put this on a fast local disk;
+        /// under WSL, the ext4 root is far faster than /mnt/c.
+        #[arg(long, default_value = "krep_tmp")]
+        tmp_dir: PathBuf,
+
+        /// Output index file.
+        #[arg(short, long, default_value = "genome.kidx")]
+        out: PathBuf,
+
+        /// Print per-record progress while counting.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
     },
 
     /// Convert a soft-masked FASTA to an all-uppercase FASTA.
@@ -319,10 +379,26 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         assembly,
         assembly_abundance,
         cbf_factor,
+        index: index_path,
+        index_threshold,
     } = args
     else {
         unreachable!()
     };
+
+    // Index-driven path: stream the target, look up genome-wide counts.
+    if let Some(idx_path) = index_path {
+        return run_mask_indexed(
+            genome,
+            idx_path,
+            *index_threshold,
+            *graph_gap,
+            *min_len,
+            out,
+            out_format,
+            soft.as_deref(),
+        );
+    }
 
     let records = fasta::read_uppercase(genome)?;
     let seq_records: Vec<(String, Vec<u8>)> =
@@ -392,7 +468,7 @@ fn apply_mask(
     let mut out_records = Vec::with_capacity(records.len());
     for (header, seq) in records {
         let mut new_seq = seq.clone();
-        for r in regions.iter().filter(|r| r.chrom == *header) {
+        for r in regions.iter().filter(|r| r.chrom == fasta::seq_id(header)) {
             for i in r.start..r.end.min(new_seq.len()) {
                 new_seq[i] = match mode {
                     MaskMode::Soft => new_seq[i].to_ascii_lowercase(),
@@ -431,59 +507,95 @@ fn run_compare_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         unreachable!()
     };
 
-    let ref_records = fasta::read(reference)?;
-    let pred_records = fasta::read(predicted)?;
-
-    if ref_records.len() != pred_records.len() {
-        return Err("reference and predicted FASTAs must have the same number of records".into());
-    }
+    // Streamed one record at a time. Loading both FASTAs in full costs ~6 GB at
+    // genome scale, which does not fit on a typical laptop.
+    let mut ref_stream = fasta::FastaStream::open(reference)?;
+    let mut pred_stream = fasta::FastaStream::open(predicted)?;
 
     let mut total = 0u64;
     let mut both_masked = 0u64;
     let mut both_unmasked = 0u64;
     let mut ref_masked_only = 0u64;
     let mut pred_masked_only = 0u64;
+    let mut compared_records = 0usize;
 
-    for (ref_rec, pred_rec) in ref_records.iter().zip(pred_records.iter()) {
-        if ref_rec.header != pred_rec.header {
-            return Err(format!(
-                "header mismatch: {} vs {}",
-                ref_rec.header, pred_rec.header
-            )
-            .into());
-        }
-        let len = ref_rec.seq.len().min(pred_rec.seq.len());
-        for i in 0..len {
-            let rb = ref_rec.seq[i];
-            let pb = pred_rec.seq[i];
-            // Treat non-ACGT or lowercase as masked in the reference.
-            let ref_masked = !matches!(rb, b'A' | b'C' | b'G' | b'T');
-            // krep only produces lowercase ACGT for soft-masked bases.
-            let pred_masked = pb.is_ascii_lowercase();
-            total += 1;
-            match (ref_masked, pred_masked) {
-                (true, true) => both_masked += 1,
-                (false, false) => both_unmasked += 1,
-                (true, false) => ref_masked_only += 1,
-                (false, true) => pred_masked_only += 1,
+    let mut pending_ref = ref_stream.next_record(false)?;
+
+    println!(
+        "{:<18} {:>13} {:>9} {:>9} {:>8} {:>8} {:>8}",
+        "record", "bases", "ref%", "pred%", "prec", "recall", "F1"
+    );
+
+    while let Some(pred_rec) = pred_stream.next_record(false)? {
+        // Allow the predicted file to cover a subset of the reference records
+        // (e.g. chr1 only, scored against the whole-genome FASTA).
+        loop {
+            match &pending_ref {
+                Some(r) if fasta::seq_id(&r.header) == fasta::seq_id(&pred_rec.header) => break,
+                Some(_) => pending_ref = ref_stream.next_record(false)?,
+                None => {
+                    return Err(format!(
+                        "record {} not found in reference",
+                        fasta::seq_id(&pred_rec.header)
+                    )
+                    .into())
+                }
             }
         }
+        let ref_rec = pending_ref.take().expect("matched above");
+        pending_ref = ref_stream.next_record(false)?;
+        compared_records += 1;
+
+        let len = ref_rec.seq.len().min(pred_rec.seq.len());
+        let (mut tp, mut fp, mut fn_, mut tn) = (0u64, 0u64, 0u64, 0u64);
+        for i in 0..len {
+            // Treat non-ACGT or lowercase as masked in the reference.
+            let ref_masked = !matches!(ref_rec.seq[i], b'A' | b'C' | b'G' | b'T');
+            let pred_masked = pred_rec.seq[i].is_ascii_lowercase();
+            match (ref_masked, pred_masked) {
+                (true, true) => tp += 1,
+                (false, true) => fp += 1,
+                (true, false) => fn_ += 1,
+                (false, false) => tn += 1,
+            }
+        }
+
+        let (p, r, f) = prf(tp, fp, fn_);
+        println!(
+            "{:<18} {:>13} {:>8.2}% {:>8.2}% {:>8.4} {:>8.4} {:>8.4}",
+            fasta::seq_id(&ref_rec.header),
+            len,
+            100.0 * (tp + fn_) as f64 / len.max(1) as f64,
+            100.0 * (tp + fp) as f64 / len.max(1) as f64,
+            p,
+            r,
+            f
+        );
+
+        total += len as u64;
+        both_masked += tp;
+        pred_masked_only += fp;
+        ref_masked_only += fn_;
+        both_unmasked += tn;
     }
 
-    let tp = both_masked;
-    let fp = pred_masked_only;
-    let fn_ = ref_masked_only;
-    let precision = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
-    let recall = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
-    let f1 = if precision + recall > 0.0 {
-        2.0 * precision * recall / (precision + recall)
-    } else {
-        0.0
-    };
+    if compared_records == 0 {
+        return Err("no records compared".into());
+    }
 
+    let (precision, recall, f1) = prf(both_masked, pred_masked_only, ref_masked_only);
+    println!("\n--- totals over {} record(s) ---", compared_records);
     println!("Bases compared:        {}", total);
-    println!("Reference masked:      {} ({:.2}%)", both_masked + ref_masked_only, 100.0 * (both_masked + ref_masked_only) as f64 / total as f64);
-    println!("Predicted masked:      {} ({:.2}%)", both_masked + pred_masked_only, 100.0 * (both_masked + pred_masked_only) as f64 / total as f64);
+    println!(
+        "Reference masked:      {} ({:.2}%)",
+        both_masked + ref_masked_only,
+        100.0 * (both_masked + ref_masked_only) as f64 / total as f64
+    );
+    println!(
+        "Predicted masked:      {} ({:.2}%)",
+        both_masked + pred_masked_only,
+        100.0 * (both_masked + pred_masked_only) as f64 / total as f64
+    );
     println!("Both masked (TP):      {}", both_masked);
     println!("Both unmasked (TN):    {}", both_unmasked);
     println!("Reference only (FN):   {}", ref_masked_only);
@@ -492,6 +604,17 @@ fn run_compare_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     println!("Recall:                {:.4}", recall);
     println!("F1:                    {:.4}", f1);
     Ok(())
+}
+
+fn prf(tp: u64, fp: u64, fn_: u64) -> (f64, f64, f64) {
+    let precision = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
+    let recall = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
+    let f1 = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    (precision, recall, f1)
 }
 
 fn run_tune_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
@@ -690,10 +813,148 @@ fn run_evaluate(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_index(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    let Commands::Index {
+        genome,
+        k,
+        sample,
+        min_count,
+        buffer,
+        tmp_dir,
+        out,
+        verbose,
+    } = args
+    else {
+        unreachable!()
+    };
+
+    let t0 = Instant::now();
+    println!(
+        "Indexing {} with k={}, sample=1/{}, min_count={} ...",
+        genome.display(),
+        k,
+        sample,
+        min_count
+    );
+    let stats = index::build(
+        genome, *k, *sample, *min_count, *buffer, tmp_dir, out, *verbose,
+    )?;
+
+    println!("\nRecords:            {}", stats.records);
+    println!("Bases:              {}", stats.bases);
+    println!("K-mers seen:        {}", stats.total_kmers);
+    println!(
+        "K-mers sampled:     {} (1/{:.1})",
+        stats.sampled_kmers,
+        stats.total_kmers as f64 / stats.sampled_kmers.max(1) as f64
+    );
+    println!("Sorted runs:        {}", stats.runs);
+    println!(
+        "Index entries:      {} ({:.0} MB resident)",
+        stats.entries,
+        stats.entries as f64 * 12.0 / 1e6
+    );
+    print!("{}", index::format_histogram(&stats));
+    println!("\nWrote {} in {:.1}s", out.display(), t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn run_mask_indexed(
+    genome: &PathBuf,
+    idx_path: &PathBuf,
+    threshold: u32,
+    max_gap: usize,
+    min_len: usize,
+    out: &PathBuf,
+    out_format: &OutputFormat,
+    soft: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let idx = index::KmerIndex::load(idx_path)?;
+    println!(
+        "Loaded index: k={}, sample=1/{}, {} entries ({:.0} MB), min_count={}",
+        idx.k,
+        idx.sample,
+        idx.len(),
+        idx.memory_bytes() as f64 / 1e6,
+        idx.min_count
+    );
+    if threshold < idx.min_count {
+        eprintln!(
+            "warning: --index-threshold {} is below the index min_count {}; \
+             k-mers rarer than {} were discarded at build time and read as count 0",
+            threshold, idx.min_count, idx.min_count
+        );
+    }
+    if max_gap < idx.sample as usize {
+        eprintln!(
+            "warning: --graph-gap {} is smaller than the sampling stride {}; \
+             seeds will not link into regions",
+            max_gap, idx.sample
+        );
+    }
+
+    let mut stream = fasta::FastaStream::open(genome)?;
+    let mut soft_writer = match soft {
+        Some(p) => Some(fasta::FastaWriter::create(p)?),
+        None => None,
+    };
+
+    let mut all_regions = Vec::new();
+    let mut total_bases = 0u64;
+    let mut total_masked = 0u64;
+
+    while let Some(mut rec) = stream.next_record(true)? {
+        let regions =
+            mask::mask_sequence_indexed(&rec.header, &rec.seq, &idx, threshold, max_gap, min_len);
+        let masked: usize = regions.iter().map(|r| r.end - r.start).sum();
+        println!(
+            "  {:<18} {:>12} bp  {:>8} regions  {:>6.2}% masked",
+            fasta::seq_id(&rec.header),
+            rec.seq.len(),
+            regions.len(),
+            100.0 * masked as f64 / rec.seq.len().max(1) as f64
+        );
+        total_bases += rec.seq.len() as u64;
+        total_masked += masked as u64;
+
+        if let Some(w) = soft_writer.as_mut() {
+            mask::apply_soft_mask(&mut rec.seq, &regions);
+            w.write_record(&rec.header, &rec.seq)?;
+        }
+        all_regions.extend(regions);
+    }
+
+    if let Some(w) = soft_writer {
+        w.finish()?;
+    }
+
+    let text = match out_format {
+        OutputFormat::Bed => mask::regions_to_bed(&all_regions),
+        OutputFormat::Gtf => mask::regions_to_gtf(&all_regions),
+    };
+    fs::write(out, text)?;
+
+    println!(
+        "\nMasked {} regions, {} of {} bp ({:.2}%) in {:.1}s",
+        all_regions.len(),
+        total_masked,
+        total_bases,
+        100.0 * total_masked as f64 / total_bases.max(1) as f64,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
         cmd @ Commands::Mock { .. } => run_mock(cmd),
+        cmd @ Commands::Index { .. } => run_index(cmd),
         cmd @ Commands::Mask { .. } => run_mask(cmd),
         cmd @ Commands::Demask { .. } => run_demask(cmd),
         cmd @ Commands::CompareMask { .. } => run_compare_mask(cmd),

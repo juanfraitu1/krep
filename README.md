@@ -48,9 +48,35 @@ krep demask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --out chm13_unmas
 # Mask a real genome and output GTF as well as soft-masked FASTA
 krep mask --genome chm13_unmasked.fa --graph --graph-gap 100 --k 18 --threshold 5 --mismatch1 --out-format gtf --out chm13_masked.gtf --soft chm13_krep_soft.fa
 
-# Compare krep's soft mask to the original RepeatMasker soft mask
+# Compare krep's soft mask to another soft-masked FASTA
 krep compare-mask --reference GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --predicted chm13_krep_soft.fa
 ```
+
+### Genome-wide counting (recommended for real genomes)
+
+The commands above count k-mers *within whatever FASTA you pass in*. That is the
+wrong scope for a real genome: a repeat family with a few hundred copies
+genome-wide has an expected count below 1 inside a 10 Mb window, so it cannot be
+detected there at all. Build an index over the whole genome once, then mask any
+subset against it:
+
+```bash
+# One pass over the genome (~32 s for T2T-CHM13, ~600 MB peak RAM)
+krep index --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --k 18 --sample 16 --min-count 2 --out chm13.k18.s16.kidx
+
+# Mask one chromosome using genome-wide counts (~1.8 s for chr1)
+krep mask --genome chm13_chr1_unmasked.fa --index chm13.k18.s16.kidx \
+  --index-threshold 4 --graph-gap 250 --min-len 30 --out chr1.bed
+
+# Score against a RepeatMasker .out converted to BED
+krep evaluate --truth chr1_rm.bed --pred chr1.bed
+```
+
+`--index-threshold` is a **genome-wide** occurrence count. It is on a completely
+different scale from the per-slice `--threshold` and must be retuned, not
+carried over: the same family that occurs 5 times in a 10 Mb slice occurs
+~1500 times across 3.1 Gb.
 
 Expected output with the high-accuracy mode on the 10 Mb mock genome:
 
@@ -148,6 +174,27 @@ Repeat families in the mock genome: ALU, LINE1, SINE, LTR, MICROSAT, SAT, **SEG_
 | `--assembly` | false | Use de Bruijn graph assembly of high-count k-mers |
 | `--assembly-abundance` | `0` | Minimum component CBF abundance (0 = automatic) |
 | `--cbf-factor` | `8` | CBF size multiplier (`slots = factor × kmers`). Lower = less RAM, more collisions |
+| `--index` | — | Use a genome-wide index (from `krep index`) instead of counting within the input FASTA |
+| `--index-threshold` | `10` | Genome-wide occurrence count required, used with `--index`. Different scale from `--threshold` |
+
+### `index`
+
+Build a genome-wide k-mer count index. Run once per genome, then mask any subset
+against it.
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--genome` | – | input FASTA (the whole genome) |
+| `--k` | 18 | k-mer length; needs k >= 17 at 3.1 Gb so random k-mers do not recur by chance |
+| `--sample` | 16 | keep 1 in N k-mers by hash (power of two); counts stay exact |
+| `--min-count` | 2 | drop k-mers rarer than this genome-wide |
+| `--buffer` | 48000000 | k-mers held in RAM before spilling a run (8 bytes each) |
+| `--tmp-dir` | `krep_tmp` | scratch space for sorted runs |
+| `--out` | `genome.kidx` | output index |
+| `--verbose` | off | per-record progress |
+
+The command prints an occurrence-count histogram, which is the practical way to
+pick `--index-threshold`.
 
 ### `demask`
 
@@ -190,29 +237,70 @@ On a 10 Mb mock genome:
 - Memory: ~80 MB for the CBF plus a few auxiliary arrays (well under 200 MB total).
 - Binary size: ~2.7 MB.
 
-### Real-genome test (T2T-CHM13 chr1, first 10 Mb)
+### Real-genome test (T2T-CHM13)
 
-Using the high-accuracy mode on an unmasked slice of the real T2T-CHM13 genome and comparing the krep soft mask back to the original RepeatMasker soft mask:
+**A note on ground truth.** The lowercase in NCBI's `*_genomic.fna` is *not*
+RepeatMasker output. Measured on this assembly:
 
-```text
-Bases compared:        10000000
-Reference masked:      3211510 (32.12%)
-Predicted masked:      2508290 (25.08%)
-Both masked (TP):      2212685
-Both unmasked (TN):    6492885
-Reference only (FN):   998825
-Predicted only (FP):   295605
-Precision:             0.8821
-Recall:                0.6890
-F1:                    0.7737
-```
+| mask | genome coverage |
+|------|-----------------|
+| NCBI `genomic.fna` lowercase | 40.27% |
+| RepeatMasker `_rm.out` | 54.19% |
 
-Runtime: ~8 seconds for the 10 Mb slice.
+On chr1 only 83% of the lowercase is explained by RepeatMasker, and the
+lowercase captures just 62% of RepeatMasker's calls. The NCBI soft-mask is a
+WindowMasker/TRF-style de novo mask. Scoring against it measures agreement with
+a *different de novo masker*, not with RepeatMasker. Download
+`GCF_..._rm.out.gz` and convert it to BED for a homology-based ground truth.
 
-krep recovers ~69% of the bases that RepeatMasker soft-masked in this region, with ~88% precision. The de novo approach naturally misses some ancient/diverged repeats and library-specific elements (e.g. SINEs with little sequence identity), while also predicting some novel low-copy repeats RepeatMasker did not annotate. It is a fast, library-free complement to RepeatMasker rather than a byte-for-byte replacement.
+**Full chr1 (248 Mb), genome-wide index, scored against RepeatMasker:**
+
+| `--index-threshold` | `--graph-gap` | precision | recall | F1 |
+|---|---|---|---|---|
+| 2 | 150 | 0.610 | 0.911 | 0.731 |
+| 3 | 250 | 0.678 | 0.850 | 0.754 |
+| **4** | **250** | **0.767** | **0.765** | **0.766** |
+| 4 | 150 | 0.832 | 0.682 | 0.750 |
+| 10 | 150 | 0.939 | 0.568 | 0.708 |
+
+Masking full chr1 takes **1.8 s** once the index is built.
+
+**Why recall plateaus.** Per-family recall at `t=4, gap=250` splits cleanly by
+family age:
+
+| recovered almost fully | recall | | largely missed | recall |
+|---|---|---|---|---|
+| Satellite/acro | 1.000 | | SINE/tRNA | 0.087 |
+| Satellite/centr | 0.999 | | DNA/Crypton | 0.122 |
+| Retroposon/SVA | 0.993 | | LINE/CR1 | 0.202 |
+| SINE/Alu | 0.978 | | LINE/L2 | 0.294 |
+| LTR/ERVK | 0.969 | | SINE/MIR | 0.378 |
+| Simple_repeat | 0.832 | | LTR/ERVL | 0.424 |
+| LINE/L1 | 0.826 | | DNA/hAT-Charlie | 0.507 |
+
+**54% of all missed bases** on chr1 are ancient, highly diverged families
+(L2, MIR, CR1, Helitron, DNA transposons). RepeatMasker finds these by aligning
+to a curated Dfam consensus; a 30%-diverged MIR copy shares essentially no exact
+18-mers with any other copy, so *no* k-mer-abundance method can recover it. This
+is a structural ceiling, not a tuning problem — closing it requires consensus
+building plus alignment, not a different threshold.
 
 ### Memory notes for large genomes
 
-The CBF size is roughly `genome_size × cbf_factor` bytes. A full human chromosome (e.g. chr1, ~250 Mb) with the default `--cbf-factor 8` needs ~2 GB of RAM for the CBF alone, plus the sequence and auxiliary structures. On an 8 GB laptop this can fail due to fragmented memory; reduce `--cbf-factor` (try `4` or `2`) or process smaller chromosomes / slices. For whole-genome runs, 16 GB or more is recommended.
+**With `krep index` (recommended).** Memory is bounded by `--buffer` (8 bytes
+per buffered k-mer; the 48M default is ~384 MB) plus the largest single record,
+regardless of genome size. Sorted runs spill to `--tmp-dir`; put that on a fast
+local disk (under WSL, the ext4 root is far faster than `/mnt/c`). For
+T2T-CHM13 at `k=18 --sample 16`: 32 s, ~2 GB of temporary files, a 235 MB index
+holding 19.6M entries.
 
-Scales roughly linearly with genome size.
+Sub-sampling is what makes this fit. Only k-mers with `hash(kmer) % sample == 0`
+are tracked, which shrinks the table by `sample` without biasing counts: the
+decision depends solely on the k-mer's own hash, so a tracked k-mer is counted at
+every occurrence and its stored count is exact. `--graph-gap` must comfortably
+exceed the sampling stride so sparse seeds still link (gap 250 with sample 16).
+
+**Without an index (legacy per-record counting).** The CBF is sized
+`genome_size x cbf_factor` bytes and is rebuilt per record, so a single human
+chromosome needs several GB and a whole genome does not fit at all. Use
+`krep index` for anything above a few tens of Mb.

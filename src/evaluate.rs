@@ -61,22 +61,28 @@ pub fn total_covered(intervals: &[Interval]) -> usize {
     if intervals.is_empty() {
         return 0;
     }
-    let mut events: Vec<(usize, i32)> = Vec::with_capacity(intervals.len() * 2);
+    // Group by chromosome first: coordinates from different chromosomes share
+    // the same numeric range, so sweeping them on one axis would merge
+    // unrelated intervals and undercount.
+    let mut by_chrom: HashMap<&str, Vec<(usize, i32)>> = HashMap::new();
     for iv in intervals {
-        events.push((iv.start, 1));
-        events.push((iv.end, -1));
+        let e = by_chrom.entry(iv.chrom.as_str()).or_default();
+        e.push((iv.start, 1));
+        e.push((iv.end, -1));
     }
-    events.sort_by_key(|e| e.0);
 
     let mut covered = 0usize;
-    let mut depth = 0i32;
-    let mut prev = events[0].0;
-    for (pos, delta) in events {
-        if depth > 0 && pos > prev {
-            covered += pos - prev;
+    for (_chrom, mut events) in by_chrom {
+        events.sort_by_key(|e| e.0);
+        let mut depth = 0i32;
+        let mut prev = events[0].0;
+        for (pos, delta) in events {
+            if depth > 0 && pos > prev {
+                covered += pos - prev;
+            }
+            depth += delta;
+            prev = pos;
         }
-        depth += delta;
-        prev = pos;
     }
     covered
 }
@@ -88,31 +94,36 @@ fn intersection(a: &[Interval], b: &[Interval]) -> usize {
         return 0;
     }
 
-    // Sweep-line with two counters: truth depth and predicted depth.
-    // A base is in the intersection when both depths are > 0.
-    let mut events: Vec<(usize, i32, i32)> = Vec::with_capacity((a.len() + b.len()) * 2);
+    // Sweep-line per chromosome with two counters: truth depth and predicted
+    // depth. A base is in the intersection when both depths are > 0.
+    let mut by_chrom: HashMap<&str, Vec<(usize, i32, i32)>> = HashMap::new();
     for iv in a {
-        events.push((iv.start, 1, 0));
-        events.push((iv.end, -1, 0));
+        let e = by_chrom.entry(iv.chrom.as_str()).or_default();
+        e.push((iv.start, 1, 0));
+        e.push((iv.end, -1, 0));
     }
     for iv in b {
-        events.push((iv.start, 0, 1));
-        events.push((iv.end, 0, -1));
-    }
-    events.sort_by_key(|e| e.0);
-
-    let mut truth_depth = 0i32;
-    let mut pred_depth = 0i32;
-    let mut total = 0usize;
-    let mut prev = events[0].0;
-
-    for (pos, d_truth, d_pred) in events {
-        if pos > prev && truth_depth > 0 && pred_depth > 0 {
-            total += pos - prev;
+        // Only chromosomes present in the truth set can contribute.
+        if let Some(e) = by_chrom.get_mut(iv.chrom.as_str()) {
+            e.push((iv.start, 0, 1));
+            e.push((iv.end, 0, -1));
         }
-        truth_depth += d_truth;
-        pred_depth += d_pred;
-        prev = pos;
+    }
+
+    let mut total = 0usize;
+    for (_chrom, mut events) in by_chrom {
+        events.sort_by_key(|e| e.0);
+        let mut truth_depth = 0i32;
+        let mut pred_depth = 0i32;
+        let mut prev = events[0].0;
+        for (pos, d_truth, d_pred) in events {
+            if pos > prev && truth_depth > 0 && pred_depth > 0 {
+                total += pos - prev;
+            }
+            truth_depth += d_truth;
+            pred_depth += d_pred;
+            prev = pos;
+        }
     }
 
     total
@@ -242,5 +253,43 @@ mod tests {
         assert!((m.precision - 1.0).abs() < 1e-9);
         assert!((m.recall - 1.0).abs() < 1e-9);
         assert!((m.f1 - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod chrom_tests {
+    use super::*;
+
+    fn iv(chrom: &str, start: usize, end: usize) -> Interval {
+        Interval {
+            chrom: chrom.to_string(),
+            start,
+            end,
+            family: None,
+        }
+    }
+
+    #[test]
+    fn covered_does_not_merge_across_chromosomes() {
+        // Same coordinates on two chromosomes are 200 bp in total, not 100.
+        let ivs = vec![iv("chr1", 0, 100), iv("chr2", 0, 100)];
+        assert_eq!(total_covered(&ivs), 200);
+    }
+
+    #[test]
+    fn intersection_is_chromosome_aware() {
+        // Identical coordinates but different chromosomes must not intersect.
+        let truth = vec![iv("chr1", 0, 100)];
+        let pred = vec![iv("chr2", 0, 100)];
+        assert_eq!(intersection(&truth, &pred), 0);
+
+        let pred_same = vec![iv("chr1", 50, 150)];
+        assert_eq!(intersection(&truth, &pred_same), 50);
+    }
+
+    #[test]
+    fn overlaps_within_a_chromosome_count_once() {
+        let ivs = vec![iv("chr1", 0, 100), iv("chr1", 50, 150)];
+        assert_eq!(total_covered(&ivs), 150);
     }
 }

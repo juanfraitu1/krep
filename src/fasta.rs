@@ -4,6 +4,14 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+/// The sequence identifier of a FASTA header: everything up to the first
+/// whitespace. FASTA headers carry a free-text description after the ID
+/// ("NC_060925.1 Homo sapiens isolate CHM13 chromosome 1, ..."), which must
+/// never reach a BED/GTF column — those are whitespace-delimited formats.
+pub fn seq_id(header: &str) -> &str {
+    header.split_whitespace().next().unwrap_or(header)
+}
+
 /// A single FASTA entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -12,6 +20,11 @@ pub struct Record {
 }
 
 impl Record {
+    /// Identifier portion of this record's header.
+    pub fn id(&self) -> &str {
+        seq_id(&self.header)
+    }
+
     pub fn new(header: impl Into<String>, seq: Vec<u8>) -> Self {
         Self {
             header: header.into(),
@@ -72,6 +85,117 @@ pub fn write<P: AsRef<Path>>(records: &[Record], path: P) -> io::Result<()> {
     Ok(())
 }
 
+/// Streaming FASTA reader: yields one record at a time so that a
+/// multi-gigabyte genome never has to be resident in full.
+///
+/// `fasta::read` loads every record at once, which is fine for a single
+/// chromosome but impossible for a 3.1 Gb genome on a small machine.
+pub struct FastaStream<R: BufRead> {
+    reader: R,
+    pending_header: Option<String>,
+    line: String,
+    done: bool,
+}
+
+impl FastaStream<BufReader<File>> {
+    /// Open a FASTA file for streaming.
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path)?;
+        Ok(Self::new(BufReader::with_capacity(1 << 20, file)))
+    }
+}
+
+impl<R: BufRead> FastaStream<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            pending_header: None,
+            line: String::new(),
+            done: false,
+        }
+    }
+
+    /// Read the next record, or `None` at end of file.
+    ///
+    /// `uppercase` converts the sequence in place; k-mer counting needs this
+    /// so that soft-masked (lowercase) input does not change k-mer keys.
+    pub fn next_record(&mut self, uppercase: bool) -> io::Result<Option<Record>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        // Find the header for the record we are about to read.
+        let header = match self.pending_header.take() {
+            Some(h) => h,
+            None => loop {
+                self.line.clear();
+                if self.reader.read_line(&mut self.line)? == 0 {
+                    self.done = true;
+                    return Ok(None);
+                }
+                if let Some(h) = self.line.trim_end().strip_prefix('>') {
+                    break h.to_string();
+                }
+            },
+        };
+
+        let mut seq = Vec::new();
+        loop {
+            self.line.clear();
+            if self.reader.read_line(&mut self.line)? == 0 {
+                self.done = true;
+                break;
+            }
+            let trimmed = self.line.trim_end();
+            if let Some(h) = trimmed.strip_prefix('>') {
+                self.pending_header = Some(h.to_string());
+                break;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            let start = seq.len();
+            seq.extend_from_slice(trimmed.as_bytes());
+            if uppercase {
+                for b in &mut seq[start..] {
+                    b.make_ascii_uppercase();
+                }
+            }
+        }
+
+        Ok(Some(Record::new(header, seq)))
+    }
+}
+
+/// Streaming FASTA writer, so masked output can be emitted record by record
+/// without holding the whole genome.
+pub struct FastaWriter {
+    writer: BufWriter<File>,
+    line_width: usize,
+}
+
+impl FastaWriter {
+    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self {
+            writer: BufWriter::with_capacity(1 << 20, File::create(path)?),
+            line_width: 80,
+        })
+    }
+
+    pub fn write_record(&mut self, header: &str, seq: &[u8]) -> io::Result<()> {
+        writeln!(self.writer, ">{}", header)?;
+        for chunk in seq.chunks(self.line_width) {
+            self.writer.write_all(chunk)?;
+            self.writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 /// Read a FASTA and convert all sequence bases to uppercase.
 /// This is what k-mer counting needs, because lowercase soft masking must
 /// not change the k-mer keys.
@@ -89,6 +213,16 @@ pub fn read_uppercase<P: AsRef<Path>>(path: P) -> io::Result<Vec<Record>> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn seq_id_strips_description() {
+        assert_eq!(
+            seq_id("NC_060925.1 Homo sapiens isolate CHM13 chromosome 1, alternate assembly"),
+            "NC_060925.1"
+        );
+        assert_eq!(seq_id("chr1"), "chr1");
+        assert_eq!(seq_id(""), "");
+    }
 
     #[test]
     fn read_write_roundtrip() {

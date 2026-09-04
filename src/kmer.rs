@@ -114,8 +114,10 @@ pub struct KmerIter<'a> {
     seq: &'a [u8],
     k: usize,
     mask: u64,
+    top_shift: u32, // 2 * (k - 1), where the complement base enters `rev`
     pos: usize,
     fwd: u64,
+    rev: u64, // reverse complement of the current window, kept incrementally
     valid: usize, // number of consecutive valid bases ending at pos-1
 }
 
@@ -131,8 +133,10 @@ impl<'a> KmerIter<'a> {
             seq,
             k,
             mask,
+            top_shift: 2 * (k as u32 - 1),
             pos: 0,
             fwd: 0,
+            rev: 0,
             valid: 0,
         }
     }
@@ -147,14 +151,19 @@ impl<'a> Iterator for KmerIter<'a> {
             self.pos += 1;
 
             if let Some(bits) = encode_base(base) {
+                // Roll both strands forward. Appending a base on the right of
+                // `fwd` prepends its complement on the left of `rev`, so the
+                // reverse complement never has to be recomputed from scratch.
                 self.fwd = ((self.fwd << 2) | bits) & self.mask;
+                self.rev = (self.rev >> 2) | ((3 - bits) << self.top_shift);
                 self.valid += 1;
                 if self.valid >= self.k {
                     let start = self.pos - self.k;
-                    return Some((start, canonical(self.fwd, self.k)));
+                    return Some((start, self.fwd.min(self.rev)));
                 }
             } else {
                 self.fwd = 0;
+                self.rev = 0;
                 self.valid = 0;
             }
         }
@@ -222,5 +231,38 @@ mod tests {
     fn neighbors_include_self() {
         let n = neighbors(0, 2, 0, false);
         assert_eq!(n, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod rolling_tests {
+    use super::*;
+
+    #[test]
+    fn rolling_canonical_matches_reference() {
+        let seq = b"ACGTTGCAANNACGTACGTTTGACCAGTNACGTAGCATCGATCGGATCCAA";
+        for k in [3usize, 7, 15, 18, 21, 31] {
+            let got: Vec<(usize, u64)> = KmerIter::new(seq, k).collect();
+            // Reference: recompute the canonical form from the raw window.
+            let mut want = Vec::new();
+            for start in 0..seq.len().saturating_sub(k - 1) {
+                let win = &seq[start..start + k];
+                let mut fwd = 0u64;
+                let mut ok = true;
+                for &b in win {
+                    match encode_base(b) {
+                        Some(bits) => fwd = (fwd << 2) | bits,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    want.push((start, canonical(fwd, k)));
+                }
+            }
+            assert_eq!(got, want, "mismatch at k={}", k);
+        }
     }
 }
