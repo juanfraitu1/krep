@@ -236,6 +236,39 @@ in single-hit mode (gate −4,2) + tandem + DUST, all 24 chromosomes in
 | LINE/L2 | 0.146 | 0.310 |
 | LINE/CR1 | 0.022 | 0.253 |
 
+### Learned hit filter
+
+RepeatMasker's accept/reject decision is family- and divergence-dependent;
+a single global score floor is not. `krep mask --lib-dump hits.tsv` writes
+every accepted library hit with its features (score, forward/backward
+scores, consensus coverage, flank gate scores, GC), and two scripts in
+`scripts/` turn a dump labelled against a reference annotation into a model
+for `--lib-model`:
+
+```bash
+# permissive dump on a training chromosome, then a test chromosome
+krep mask --genome chr2.fa --library dfam_human.fa --lib-single-hit --lib-gate=-4,2 \
+  --lib-min-score 15 --lib-dump chr2_hits.tsv --out /dev/null
+python3 scripts/train_thresholds.py chr2_hits.tsv chr2_rm_family.bed model_thr.tsv   # per-consensus floors
+python3 scripts/train_logistic.py chr2_hits.tsv chr2_rm_family.bed chr1_hits.tsv chr1_rm_family.bed model_thr.tsv model_logit.tsv
+krep mask --genome chr1.fa --library dfam_human.fa --lib-single-hit --lib-gate=-4,2 \
+  --lib-min-score 15 --lib-model model_logit.tsv --out chr1.bed
+```
+
+Trained on chr2, tested on chr1 (Dfam single-hit, gate −4,2):
+
+| filter | P | R | F1 | MIR | L2 | CR1 |
+|---|---|---|---|---|---|---|
+| global floor 30 | 0.992 | 0.823 | 0.899 | 0.42 | 0.32 | 0.26 |
+| per-consensus floors | 0.977 | 0.846 | 0.907 | 0.51 | 0.42 | 0.36 |
+| logistic + per-consensus offset | 0.976 | 0.850 | **0.909** | 0.51 | 0.42 | 0.36 |
+
+The learned floors say why: 1,008 of 1,402 consensi want a floor in the 20s,
+48 want ≥50 and 30 are best dropped outright. The logistic model's weights
+put most of the remaining signal in hit length and per-base score. The
+training scripts are plain Python (no NumPy) and take a few minutes on ~1.6M
+candidates.
+
 Whether to use this is a policy choice: with Dfam, krep is no longer library-free.
 
 ### NCBI-style masking (WindowMasker + TRF + DUST)
@@ -369,6 +402,8 @@ Repeat families in the mock genome: ALU, LINE1, SINE, LTR, MICROSAT, SAT, **SEG_
 | `--lib-xdrop` | `40` | Stop extending once the score falls this far below its best |
 | `--lib-seed` | PatternHunter w11 | Spaced seed for library hits (weight 8–13, need not be symmetric). Weight 9 (`11101001100111`) is the sensitivity/speed knee on human |
 | `--lib-single-hit` | off | Trigger extension on every gated seed hit instead of two hits on one diagonal; more sensitive to short diverged fragments |
+| `--lib-dump` | — | Write every accepted library hit with its features to a TSV, for training `--lib-model` |
+| `--lib-model` | — | Learned filter: per-consensus minimum scores (`name<TAB>score`) or a logistic model (`#logistic` header) from `scripts/` |
 | `--lib-gate` | `4,6` | Single-hit gate "SUM,SIDE" on the ungapped flank score (32 bp each side of the seed, seed excluded; random flanks average −16 per side). This is the sensitivity/speed dial: on chr1 with Dfam, `4,6` 69 s / F1 0.890, `0,4` 101 s / 0.895, `-4,2` 190 s / 0.899, `-8,0` 432 s / 0.902, `-12,-2` 921 s / 0.904. Negative values need the `--lib-gate=-4,2` form |
 | `--tandem` | off | Tandem repeats: k-mer (`--tandem-k`, 5) recurrence at a fixed period ≤ `--tandem-max-period` (500), kept if dense (`--tandem-density`, 0.25) and periodic identity ≥ `--tandem-identity` (0.7), length ≥ `--tandem-min-len` (20) |
 | `--dust` | off | Low complexity: DUST triplet-skew score over `--dust-window` (64) bases above `--dust-threshold` (5; random ~0.5, (CA)n ~15, poly-A ~31) |

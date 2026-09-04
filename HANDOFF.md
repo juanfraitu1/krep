@@ -221,6 +221,25 @@ killed once mid-run; `run_genome.sh` relaunches it detached
 Data: `C:\krep_work\dfam_human.fa` (1,403 consensi, headers `name#accession`),
 `krep_plus_dfam.fa` (v2 + Dfam concatenated).
 
+## Round 5: learned hit filter (ML step 1)
+
+- `--lib-dump` writes accepted hits with features; `--lib-model` applies
+  either per-consensus floors (`scripts/train_thresholds.py`: floor per
+  consensus maximizing cumulative true-minus-false bases) or a logistic
+  model with per-consensus offsets (`scripts/train_logistic.py`: pure-Python
+  SGD, base-weighted loss, features standardized; offline evaluator merges
+  kept intervals — an earlier version double-counted overlaps and reported
+  recall > 1).
+- Train chr2 → test chr1, Dfam single-hit −4,2: floor 30 F1 0.899 →
+  per-consensus floors 0.9065 → logistic 0.9085 (P 0.976 / R 0.850).
+  Hybrid (k18@32 + Dfam + tandem + dust) + floors on chr1: 0.9066.
+- Dumps: `C:\krep_work\chr{1,2}_cand.tsv` (1.6M rows each, floor 15);
+  models `model_chr2.tsv`, `model_logit.tsv`; `chm13_chr2_unmasked.fa`,
+  `chr2_rm_family.bed`.
+- Next in this direction: gradient boosting over the same features; a
+  divergence-aware (transition/transversion) scoring matrix estimated from
+  krep's confident alignments; profile HMMs for the ancient families.
+
 ## What would still move it
 
 - **CR1 / Helitron / Tip100 have no usable consensi** (recall ≈ 0). Their

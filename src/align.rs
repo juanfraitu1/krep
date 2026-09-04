@@ -33,6 +33,25 @@ const SLOTS: usize = 2;
 /// entries with the best ungapped gate scores.
 const SINGLE_HIT_TOP: usize = 2;
 
+/// One accepted library hit with the features a learned filter can use.
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub start: usize,
+    pub end: usize,
+    /// Consensus index (not oriented).
+    pub cid: usize,
+    pub strand: bool,
+    pub score: i32,
+    pub score_fwd: i32,
+    pub score_bwd: i32,
+    /// Consensus bases consumed forward / backward from the anchor.
+    pub cons_fwd: usize,
+    pub cons_bwd: usize,
+    pub cons_len: usize,
+    pub gate_left: i32,
+    pub gate_right: i32,
+}
+
 pub struct Library {
     pub names: Vec<String>,
     /// Oriented consensi: index 2c is consensus c forward, 2c+1 its reverse
@@ -56,6 +75,37 @@ pub struct Library {
     /// short fragments whose flanks run into random sequence, and slower.
     pub gate_sum: i32,
     pub gate_side: i32,
+    /// Learned per-consensus minimum score (indexed by consensus id); a hit
+    /// must clear both this and `min_score`. Empty means none.
+    pub thresholds: Vec<i32>,
+    /// Optional logistic filter over hit features with a per-consensus
+    /// offset (see `train_logistic.py`).
+    pub logistic: Option<Logistic>,
+}
+
+/// Logistic hit filter: p = sigmoid(b0 + offset[cid] + w . z(features)),
+/// accept when p >= tau. Features, in order: score, ln(length),
+/// score/length, consensus coverage, GC, gate sum, gate min, ln(consensus
+/// length); `mu`/`sd` standardize them as at training time.
+#[derive(Clone, Debug)]
+pub struct Logistic {
+    pub w: [f64; 8],
+    pub b0: f64,
+    pub tau: f64,
+    pub mu: [f64; 8],
+    pub sd: [f64; 8],
+    pub offsets: Vec<f64>,
+}
+
+impl Logistic {
+    #[inline]
+    fn prob(&self, cid: usize, x: [f64; 8]) -> f64 {
+        let mut z = self.b0 + self.offsets.get(cid).copied().unwrap_or(0.0);
+        for j in 0..8 {
+            z += self.w[j] * (x[j] - self.mu[j]) / self.sd[j];
+        }
+        1.0 / (1.0 + (-z.clamp(-30.0, 30.0)).exp())
+    }
 }
 
 fn revcomp(seq: &[u8]) -> Vec<u8> {
@@ -169,7 +219,59 @@ impl Library {
             single_hit: false,
             gate_sum: 4,
             gate_side: 6,
+            thresholds: Vec::new(),
+            logistic: None,
         })
+    }
+
+    /// Load a learned model. Either per-consensus minimum scores
+    /// (`name<TAB>min_score`) or a logistic model (`#logistic`, `#mu`, `#sd`
+    /// header lines followed by `name<TAB>offset`). Consensi absent from a
+    /// threshold file keep `min_score`.
+    pub fn load_thresholds(&mut self, path: &Path) -> io::Result<usize> {
+        use std::collections::HashMap;
+        let text = std::fs::read_to_string(path)?;
+        if text.starts_with("#logistic") {
+            let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+            let mut lines = text.lines();
+            let nums = |l: &str| -> Vec<f64> { l.split('\t').skip(1).filter_map(|v| v.trim().parse().ok()).collect() };
+            let head = nums(lines.next().ok_or_else(|| bad("empty model"))?);
+            if head.len() != 10 { return Err(bad("#logistic needs 8 weights, b0, tau")); }
+            let mu = nums(lines.next().ok_or_else(|| bad("missing #mu"))?);
+            let sd = nums(lines.next().ok_or_else(|| bad("missing #sd"))?);
+            if mu.len() != 8 || sd.len() != 8 { return Err(bad("#mu/#sd need 8 values")); }
+            let by_name: HashMap<&str, f64> = lines
+                .filter_map(|l| { let mut f = l.split('\t'); Some((f.next()?, f.next()?.trim().parse().ok()?)) })
+                .collect();
+            let mut w = [0.0; 8]; w.copy_from_slice(&head[..8]);
+            let mut m = [0.0; 8]; m.copy_from_slice(&mu);
+            let mut d = [0.0; 8]; d.copy_from_slice(&sd);
+            self.logistic = Some(Logistic {
+                w, b0: head[8], tau: head[9], mu: m, sd: d,
+                offsets: self.names.iter().map(|n| *by_name.get(n.as_str()).unwrap_or(&0.0)).collect(),
+            });
+            return Ok(by_name.len());
+        }
+        let by_name: HashMap<&str, i32> = text
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                let name = f.next()?;
+                let t = f.next()?.trim().parse().ok()?;
+                Some((name, t))
+            })
+            .collect();
+        self.thresholds = self
+            .names
+            .iter()
+            .map(|n| *by_name.get(n.as_str()).unwrap_or(&self.min_score))
+            .collect();
+        Ok(by_name.len())
+    }
+
+    #[inline]
+    fn accept(&self, cid: usize, total: i32) -> bool {
+        total >= self.min_score && self.thresholds.get(cid).is_none_or(|&t| total >= t)
     }
 
     pub fn len(&self) -> usize {
@@ -186,9 +288,15 @@ impl Library {
 
     /// Mask one record. Returns merged regions named by consensus and score.
     pub fn mask_record(&self, chrom: &str, seq: &[u8]) -> Vec<MaskedRegion> {
+        self.mask_record_with_candidates(chrom, seq).0
+    }
+
+    /// Mask one record and also return every accepted hit with its features
+    /// (unmerged), for training or applying a learned filter.
+    pub fn mask_record_with_candidates(&self, chrom: &str, seq: &[u8]) -> (Vec<MaskedRegion>, Vec<Candidate>) {
         let n_starts = seq.len().saturating_sub(self.span - 1);
         if n_starts == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let block = n_starts.div_ceil(rayon::current_num_threads().max(1)).max(1 << 20);
         let mut bounds = Vec::new();
@@ -198,22 +306,31 @@ impl Library {
             b += block;
         }
         let chrom_id = fasta::seq_id(chrom).to_string();
-        let parts: Vec<Vec<MaskedRegion>> = bounds
+        let parts: Vec<Vec<Candidate>> = bounds
             .into_par_iter()
-            .map(|(bs, be)| self.scan_block(&chrom_id, seq, bs, be))
+            .map(|(bs, be)| self.scan_block(seq, bs, be))
             .collect();
-        let mut all: Vec<MaskedRegion> = parts.into_iter().flatten().collect();
+        let cands: Vec<Candidate> = parts.into_iter().flatten().collect();
+        let mut all: Vec<MaskedRegion> = cands
+            .iter()
+            .map(|c| MaskedRegion {
+                chrom: chrom_id.clone(),
+                start: c.start,
+                end: c.end,
+                name: format!("{}:{}", self.names[c.cid], c.score),
+            })
+            .collect();
         merge_regions(&mut all);
-        all
+        (all, cands)
     }
 
-    fn scan_block(&self, chrom: &str, seq: &[u8], bs: usize, be: usize) -> Vec<MaskedRegion> {
+    fn scan_block(&self, seq: &[u8], bs: usize, be: usize) -> Vec<Candidate> {
         let span = self.span;
         let weight = self.seed.weight();
         let mask = if span == 32 { u64::MAX } else { (1u64 << (2 * span)) - 1 };
         // Warm the rolling window so the first emitted seed starts at `bs`.
         let warm = bs.saturating_sub(span - 1);
-        let mut regions = Vec::new();
+        let mut regions: Vec<Candidate> = Vec::new();
         // Chaining state: the last few hits per oriented consensus, as
         // (genome pos, diagonal, consensus pos). A real copy hits the same
         // consensus on the same diagonal again and again, so remembering two
@@ -277,16 +394,9 @@ impl Library {
                 }
                 cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                 for &(_, oi, cpos) in cands.iter() {
-                    if let Some((start, end, score)) =
-                        self.extend_gated(seq, oi as usize, cpos as usize, g)
-                    {
-                        regions.push(MaskedRegion {
-                            chrom: chrom.to_string(),
-                            start,
-                            end,
-                            name: format!("{}:{}", self.names[oi as usize / 2], score),
-                        });
-                        masked_until = end;
+                    if let Some(c) = self.extend_gated(seq, oi as usize, cpos as usize, g) {
+                        masked_until = c.end;
+                        regions.push(c);
                         break;
                     }
                     failed[oi as usize] = (g as u32, g as i64 - cpos as i64);
@@ -305,16 +415,9 @@ impl Library {
                 });
                 if let Some(ai) = anchor {
                     let (g0, _, cpos0) = slots[ai];
-                    if let Some((start, end, score)) =
-                        self.extend_hit(seq, oi as usize, cpos0 as usize, g0 as usize)
-                    {
-                        regions.push(MaskedRegion {
-                            chrom: chrom.to_string(),
-                            start,
-                            end,
-                            name: format!("{}:{}", self.names[oi as usize / 2], score),
-                        });
-                        masked_until = end;
+                    if let Some(c) = self.extend_hit(seq, oi as usize, cpos0 as usize, g0 as usize) {
+                        masked_until = c.end;
+                        regions.push(c);
                         break;
                     }
                     // Failed pair: forget it so the same spurious diagonal does
@@ -367,30 +470,80 @@ impl Library {
         if pass { Some(sl + sr) } else { None }
     }
 
+    /// The two flank scores, for feature output.
+    #[inline]
+    fn gate_sides(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> (i32, i32) {
+        let cons = &self.seqs[oi];
+        let span = self.span;
+        let left = cpos.min(gpos).min(32);
+        let (cr, gr) = (cpos + span, gpos + span);
+        let right = cons.len().saturating_sub(cr).min(seq.len().saturating_sub(gr)).min(32);
+        let (mut sl, mut sr) = (0i32, 0i32);
+        for o in 0..left {
+            sl += if cons[cpos - 1 - o] == seq[gpos - 1 - o] { MATCH } else { MISMATCH };
+        }
+        for o in 0..right {
+            sr += if cons[cr + o] == seq[gr + o] { MATCH } else { MISMATCH };
+        }
+        (sl, sr)
+    }
+
     /// Extend from an anchored seed in both directions (gate first).
-    fn extend_hit(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<(usize, usize, i32)> {
+    fn extend_hit(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<Candidate> {
         self.gate(seq, oi, cpos, gpos)?;
         self.extend_gated(seq, oi, cpos, gpos)
     }
 
     /// Banded X-drop extension both ways from an anchor that already passed
-    /// the gate. Returns the genome interval and total score if it clears
-    /// `min_score`.
-    fn extend_gated(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<(usize, usize, i32)> {
+    /// the gate. Returns the hit if it clears the score floor (and the
+    /// learned per-consensus threshold, if any).
+    fn extend_gated(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<Candidate> {
         let cons = &self.seqs[oi];
         let band = self.band;
         // Forward: consensus tail vs a bounded genome slice.
         let c_fwd = &cons[cpos..];
         let g_end = (gpos + c_fwd.len() + band + 64).min(seq.len());
-        let (sf, _, gf) = xdrop_extend(c_fwd, &seq[gpos..g_end], band, self.xdrop, false);
+        let (sf, cf, gf) = xdrop_extend(c_fwd, &seq[gpos..g_end], band, self.xdrop, false);
         // Backward: the same DP walked from the ends of the prefixes, so no
         // reversed copies are allocated per extension.
         let c_bwd = &cons[..cpos];
         let g_start = gpos.saturating_sub(c_bwd.len() + band + 64);
-        let (sb, _, gb) = xdrop_extend(c_bwd, &seq[g_start..gpos], band, self.xdrop, true);
+        let (sb, cb, gb) = xdrop_extend(c_bwd, &seq[g_start..gpos], band, self.xdrop, true);
         let total = sf + sb;
-        if total >= self.min_score && gf + gb >= 30 {
-            Some((gpos - gb, gpos + gf, total))
+        if self.accept(oi / 2, total) && gf + gb >= 30 {
+            let (gl, gr) = self.gate_sides(seq, oi, cpos, gpos);
+            if let Some(m) = &self.logistic {
+                let (start, end) = (gpos - gb, gpos + gf);
+                let len = (end - start) as f64;
+                let gc = seq[start..end].iter().filter(|&&b| b == b'G' || b == b'C').count() as f64 / len;
+                let x = [
+                    total as f64,
+                    len.ln(),
+                    total as f64 / len,
+                    (cf + cb) as f64 / cons.len().max(1) as f64,
+                    gc,
+                    (gl + gr) as f64,
+                    gl.min(gr) as f64,
+                    (cons.len() as f64).ln(),
+                ];
+                if m.prob(oi / 2, x) < m.tau {
+                    return None;
+                }
+            }
+            Some(Candidate {
+                start: gpos - gb,
+                end: gpos + gf,
+                cid: oi / 2,
+                strand: oi % 2 == 0,
+                score: total,
+                score_fwd: sf,
+                score_bwd: sb,
+                cons_fwd: cf,
+                cons_bwd: cb,
+                cons_len: cons.len(),
+                gate_left: gl,
+                gate_right: gr,
+            })
         } else {
             None
         }

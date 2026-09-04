@@ -213,6 +213,18 @@ enum Commands {
         #[arg(long, value_delimiter = ',', default_value = "4,6")]
         lib_gate: Vec<i32>,
 
+        /// Write every accepted library hit with its features to this TSV
+        /// (chrom, start, end, consensus, strand, score, score_fwd, score_bwd,
+        /// cons_fwd, cons_bwd, cons_len, gate_left, gate_right, gc). Label
+        /// these against a reference annotation to train `--lib-model`.
+        #[arg(long, value_name = "TSV")]
+        lib_dump: Option<PathBuf>,
+
+        /// Learned per-consensus minimum scores (TSV `name<TAB>min_score`);
+        /// a hit must clear both this and --lib-min-score.
+        #[arg(long, value_name = "TSV")]
+        lib_model: Option<PathBuf>,
+
         /// Also detect tandem repeats (Tandem Repeats Finder-style): k-mer
         /// recurrence at a fixed period, verified by periodic self-identity.
         /// Supplies the TRF half of an NCBI-style mask and lifts
@@ -581,6 +593,8 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         lib_seed,
         lib_single_hit,
         lib_gate,
+        lib_dump,
+        lib_model,
         tandem,
         tandem_max_period,
         tandem_min_len,
@@ -628,6 +642,10 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
                     l.gate_sum = lib_gate[0];
                     l.gate_side = lib_gate[1];
                 }
+                if let Some(m) = lib_model {
+                    let n = l.load_thresholds(m)?;
+                    println!("Loaded learned thresholds for {} consensi from {}", n, m.display());
+                }
                 Some(l)
             }
             None => None,
@@ -649,6 +667,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             lib.as_ref(),
             tandem_params,
             if *dust { Some((*dust_window, *dust_threshold)) } else { None },
+            lib_dump.as_deref(),
             out,
             out_format,
             soft.as_deref(),
@@ -1137,6 +1156,7 @@ fn run_mask_indexed(
     library: Option<&align::Library>,
     tandem_params: Option<tandem::TandemParams>,
     dust: Option<(usize, f64)>,
+    lib_dump: Option<&std::path::Path>,
     out: &PathBuf,
     out_format: &OutputFormat,
     soft: Option<&std::path::Path>,
@@ -1197,6 +1217,15 @@ fn run_mask_indexed(
         );
     }
 
+    let mut dump_writer = match lib_dump {
+        Some(p) => {
+            use std::io::Write as _;
+            let mut w = std::io::BufWriter::new(fs::File::create(p)?);
+            writeln!(w, "chrom\tstart\tend\tconsensus\tstrand\tscore\tscore_fwd\tscore_bwd\tcons_fwd\tcons_bwd\tcons_len\tgate_left\tgate_right\tgc")?;
+            Some(w)
+        }
+        None => None,
+    };
     let mut stream = fasta::FastaStream::open(genome)?;
     let mut soft_writer = match soft {
         Some(p) => Some(fasta::FastaWriter::create(p)?),
@@ -1217,7 +1246,24 @@ fn run_mask_indexed(
             )
         };
         if let Some(lib) = library {
-            regions.extend(lib.mask_record(&rec.header, &rec.seq));
+            let (lib_regions, cands) = lib.mask_record_with_candidates(&rec.header, &rec.seq);
+            if let Some(w) = dump_writer.as_mut() {
+                use std::io::Write as _;
+                let id = fasta::seq_id(&rec.header);
+                for c in &cands {
+                    let win = &rec.seq[c.start..c.end];
+                    let gc = win.iter().filter(|&&b| b == b'G' || b == b'C').count() as f64
+                        / win.len().max(1) as f64;
+                    writeln!(
+                        w,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+                        id, c.start, c.end, lib.names[c.cid], if c.strand { '+' } else { '-' },
+                        c.score, c.score_fwd, c.score_bwd, c.cons_fwd, c.cons_bwd, c.cons_len,
+                        c.gate_left, c.gate_right, gc
+                    )?;
+                }
+            }
+            regions.extend(lib_regions);
             align::merge_regions(&mut regions);
         }
         if let Some(tp) = tandem_params {
@@ -1248,6 +1294,10 @@ fn run_mask_indexed(
 
     if let Some(w) = soft_writer {
         w.finish()?;
+    }
+    if let Some(mut w) = dump_writer {
+        use std::io::Write as _;
+        w.flush()?;
     }
 
     let text = match out_format {
