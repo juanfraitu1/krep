@@ -108,6 +108,175 @@ pub fn neighbors(center: u64, k: usize, max_mismatches: usize, exclude_self: boo
         .collect()
 }
 
+/// A spaced seed: a pattern of care (`1`) and don't-care (`0`) positions.
+///
+/// A contiguous 18-mer requires 18 consecutive unmutated bases, which a copy
+/// 30% diverged from its family consensus satisfies with probability
+/// 0.7^18 ≈ 0.16%. A weight-14 seed over a 20-base span only needs the 14
+/// care positions to match (0.7^14 ≈ 0.7%), and the don't-care positions absorb
+/// exactly the substitutions those ancient copies carry. This is the standard
+/// PatternHunter-style trick for sensitive homology search.
+///
+/// The pattern must be symmetric (read the same left-to-right and
+/// right-to-left) so that the seed extracted from the reverse-complement window
+/// is the reverse complement of the seed extracted from the forward window;
+/// canonicalization then works exactly as it does for plain k-mers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpacedSeed {
+    pattern: String,
+    span: usize,
+    weight: usize,
+    /// Maximal runs of care positions, in pattern order (leftmost first), as
+    /// (bit offset of the run's rightmost base within the span window, bases).
+    runs: Vec<(u32, u32)>,
+}
+
+impl SpacedSeed {
+    /// Parse a pattern such as `11011011011011011011`.
+    pub fn parse(pattern: &str) -> Result<Self, String> {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || !pattern.bytes().all(|b| b == b'0' || b == b'1') {
+            return Err(format!("seed pattern must be a string of 0/1, got {:?}", pattern));
+        }
+        let span = pattern.len();
+        let weight = pattern.bytes().filter(|&b| b == b'1').count();
+        if span > 32 {
+            return Err(format!("seed span must be <= 32 (got {})", span));
+        }
+        if weight == 0 {
+            return Err("seed pattern needs at least one care position".into());
+        }
+        if !pattern.starts_with('1') || !pattern.ends_with('1') {
+            return Err("seed pattern must start and end with 1".into());
+        }
+        if pattern.bytes().ne(pattern.bytes().rev()) {
+            return Err(format!(
+                "seed pattern must be symmetric so reverse-complement canonicalization is exact (got {})",
+                pattern
+            ));
+        }
+
+        // Base i of the pattern (0 = leftmost = oldest) lives at bit offset
+        // 2*(span-1-i) in a window whose most recent base is in the low bits.
+        let mut runs = Vec::new();
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        while i < span {
+            if bytes[i] == b'1' {
+                let start = i;
+                while i < span && bytes[i] == b'1' {
+                    i += 1;
+                }
+                let len = (i - start) as u32;
+                let rightmost = (i - 1) as u32;
+                let offset = 2 * (span as u32 - 1 - rightmost);
+                runs.push((offset, len));
+            } else {
+                i += 1;
+            }
+        }
+
+        Ok(Self {
+            pattern: pattern.to_string(),
+            span,
+            weight,
+            runs,
+        })
+    }
+
+    /// A contiguous k-mer, expressed as an all-care seed.
+    pub fn contiguous(k: usize) -> Self {
+        Self::parse(&"1".repeat(k)).expect("all-ones pattern is always valid")
+    }
+
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    pub fn span(&self) -> usize {
+        self.span
+    }
+
+    pub fn weight(&self) -> usize {
+        self.weight
+    }
+
+    /// Extract the seed value from a window holding `span` bases, most recent
+    /// base in the low 2 bits. Care bases are concatenated in pattern order.
+    #[inline]
+    pub fn extract(&self, window: u64) -> u64 {
+        let mut v = 0u64;
+        for &(offset, len) in &self.runs {
+            let mask = if len >= 32 { u64::MAX } else { (1u64 << (2 * len)) - 1 };
+            v = (v << (2 * len)) | ((window >> offset) & mask);
+        }
+        v
+    }
+}
+
+/// Iterator over canonical spaced-seed values of a DNA sequence.
+///
+/// Emits `(position, canonical_seed)` for every fully-ACGT window of `span`
+/// bases, where `position` is the window start. With an all-ones pattern this
+/// is exactly `KmerIter`.
+pub struct SeedIter<'a> {
+    seq: &'a [u8],
+    seed: &'a SpacedSeed,
+    span: usize,
+    mask: u64,
+    top_shift: u32,
+    pos: usize,
+    fwd: u64,
+    rev: u64,
+    valid: usize,
+}
+
+impl<'a> SeedIter<'a> {
+    pub fn new(seq: &'a [u8], seed: &'a SpacedSeed) -> Self {
+        let span = seed.span();
+        let mask = if span == 32 { u64::MAX } else { (1u64 << (2 * span)) - 1 };
+        Self {
+            seq,
+            seed,
+            span,
+            mask,
+            top_shift: 2 * (span as u32 - 1),
+            pos: 0,
+            fwd: 0,
+            rev: 0,
+            valid: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for SeedIter<'a> {
+    type Item = (usize, u64);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos < self.seq.len() {
+            let base = self.seq[self.pos];
+            self.pos += 1;
+            if let Some(bits) = encode_base(base) {
+                self.fwd = ((self.fwd << 2) | bits) & self.mask;
+                self.rev = (self.rev >> 2) | ((3 - bits) << self.top_shift);
+                self.valid += 1;
+                if self.valid >= self.span {
+                    let start = self.pos - self.span;
+                    let f = self.seed.extract(self.fwd);
+                    let r = self.seed.extract(self.rev);
+                    return Some((start, f.min(r)));
+                }
+            } else {
+                self.fwd = 0;
+                self.rev = 0;
+                self.valid = 0;
+            }
+        }
+        None
+    }
+}
+
 /// Iterator over canonical k-mers of a DNA sequence.
 /// Emits `(position, canonical_kmer)` for every fully-ACGT window.
 pub struct KmerIter<'a> {
@@ -264,5 +433,78 @@ mod rolling_tests {
             }
             assert_eq!(got, want, "mismatch at k={}", k);
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    fn revcomp(seq: &[u8]) -> Vec<u8> {
+        seq.iter()
+            .rev()
+            .map(|b| match b {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                x => *x,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contiguous_seed_matches_kmer_iter() {
+        let seq = b"ACGTTGCAANNACGTACGTTTGACCAGTNACGTAGCATCGATCGGATCCAA";
+        for k in [5usize, 11, 18, 21] {
+            let seed = SpacedSeed::contiguous(k);
+            let a: Vec<_> = SeedIter::new(seq, &seed).collect();
+            let b: Vec<_> = KmerIter::new(seq, k).collect();
+            assert_eq!(a, b, "k={}", k);
+        }
+    }
+
+    #[test]
+    fn spaced_seed_is_strand_symmetric() {
+        // Symmetric weight-14 / span-20 pattern.
+        let seed = SpacedSeed::parse("11011011011011011011").unwrap();
+        assert_eq!(seed.span(), 20);
+        assert_eq!(seed.weight(), 14);
+
+        let seq = b"ACGTTGCAAGGACGTACGTTTGACCAGTCACGTAGCATCGATCGGATCCAATTGACC";
+        let rc = revcomp(seq);
+        let fwd: Vec<_> = SeedIter::new(seq, &seed).collect();
+        let rev: Vec<_> = SeedIter::new(&rc, &seed).collect();
+        assert_eq!(fwd.len(), rev.len());
+        // Window at position p on the forward strand is the window at
+        // len - span - p on the reverse strand; canonical values must agree.
+        let n = seq.len();
+        for (p, v) in &fwd {
+            let q = n - seed.span() - p;
+            let (_, w) = rev.iter().find(|(pos, _)| *pos == q).unwrap();
+            assert_eq!(v, w, "position {}", p);
+        }
+    }
+
+    #[test]
+    fn spaced_seed_ignores_dont_care_positions() {
+        let seed = SpacedSeed::parse("101").unwrap();
+        // ACA vs AGA differ only at the don't-care position.
+        let a: Vec<_> = SeedIter::new(b"ACA", &seed).collect();
+        let b: Vec<_> = SeedIter::new(b"AGA", &seed).collect();
+        assert_eq!(a, b);
+        // ACA vs CCA differ at a care position.
+        let c: Vec<_> = SeedIter::new(b"CCA", &seed).collect();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn rejects_bad_patterns() {
+        assert!(SpacedSeed::parse("").is_err());
+        assert!(SpacedSeed::parse("1101").is_err()); // asymmetric
+        assert!(SpacedSeed::parse("0110").is_err()); // must start/end with 1
+        assert!(SpacedSeed::parse("1x1").is_err());
+        assert!(SpacedSeed::parse(&"1".repeat(33)).is_err());
+        assert!(SpacedSeed::parse("1").is_ok());
     }
 }

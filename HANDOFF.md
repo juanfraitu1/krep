@@ -75,40 +75,82 @@ MIR copy shares essentially no exact 18-mers with any other copy, so no
 abundance method recovers it. Closing that gap needs consensus building plus
 alignment, not tuning.
 
-## Suggested next steps
+## Round 2: spaced seeds, hysteresis, density gate (measured)
 
-1. **Re-tune on a representative target.** Use full chr1 (or several
-   chromosomes) rather than the 10 Mb subtelomere slice, and score against
-   `chr1_rm.bed`, not the fna lowercase.
-2. **Spaced seeds** instead of contiguous k-mers — the single highest-value
-   change for the ancient families. A weight-14 seed over an 18-base span
-   tolerates mismatches in don't-care positions, which is exactly what MIR/L2
-   need. Sub-sampling is compatible (hash the extracted seed).
-3. **Multiple k in one index** (`k=15` alongside `k=18`) and take the union;
-   smaller k is more divergence-tolerant but needs a higher threshold.
-4. **`--mismatch1` is incompatible with hash sub-sampling** — a Hamming
-   neighbour of a sampled k-mer is almost never itself sampled. Either run
-   `--sample 1` for mismatch expansion, or use spaced seeds instead.
-5. **Boundary refinement.** Seeds are ~16 bp apart, so region edges are fuzzy to
-   that scale; trimming edges against a denser local scan would lift precision.
-6. Genome-wide masking run (all 24 records) to confirm scaling end to end.
+Goal was recall on the ancient families. Added, all behind flags with
+defaults that preserve prior behaviour:
+
+- `krep index --seed PATTERN` — symmetric spaced seeds (`kmer::SpacedSeed`,
+  `SeedIter`); pattern stored in the index header (format v2; v1 indices are
+  rejected with a rebuild message).
+- `krep index --passes N` — hash-partitioned multi-pass counting so `--sample 1`
+  fits in bounded temp/RAM. Test asserts byte-identical output for 1 vs 4 passes.
+- `krep mask --index A --index B --index-threshold tA,tB` — union of several
+  indices with per-index thresholds.
+- `--index-threshold-low` (hysteresis) and `--min-hits` / `--min-density`
+  (component density gate).
+
+Results on full chr1 vs RepeatMasker (baseline k18@4 gap 250: F1 0.766):
+
+- Hysteresis alone: **no gain** (best 0.762). Lowering the extension threshold
+  raises recall but precision collapses because weak seeds *bridge* unique DNA
+  between nearby repeats. Bridging, not nucleation, is the FP source.
+- Spaced w16/s22 at `--sample 1`: at low thresholds it masks the whole
+  chromosome (composition background: 47M distinct seeds with count >= 8). At
+  t=64 with gap 100-150 it matches k18's F1 with higher P / lower R. Weight
+  cannot drop below 16 at 3.1 Gb, so the sensitivity gain is only ~2x per copy
+  and the required threshold increase eats it for mid-count families.
+- **Union k18@4 ∪ spaced@64, gap 150, density 0.03: P 0.749 / R 0.802 /
+  F1 0.7745** — best found. MIR 0.378→0.468, hAT-Charlie 0.507→0.593,
+  L1 0.826→0.888, Simple_repeat 0.832→0.938. L2 flat (0.294→0.309).
+
+Everything converges at F1 ≈ 0.775. That is the de novo copy-vs-copy ceiling
+here; the remaining ~20% of RepeatMasker's bases are copies that share no seed
+with any other copy at a usable weight.
+
+## What would actually move the ceiling
+
+1. **Consensus + alignment (RepeatScout-style).** Seed from high-count entries
+   in the index, gather occurrences with flanks, extend a consensus by majority
+   vote, then align consensi back (seed-chain-extend, banded) and mask hits.
+   Helps L1M / MaLR / Charlie most; MIR/L2 need copies that align to each
+   other, which is exactly what they lack.
+2. **Library mode (Dfam consensi).** Only route to MIR/L2 parity. Stops being
+   de novo. Index the ~1,500 human consensi with spaced seeds, scan the genome,
+   extend hits.
+3. **Density-gated bridging** (not implemented): allow a gap to be bridged only
+   if hits inside it meet a local density, decoupling "extend through mutated
+   stretch" from "jump across unique DNA". The density gate here is per
+   component, not per gap.
+4. Genome-wide run across all 24 records to confirm the streaming path end to
+   end at scale.
 
 ## Data locations
 
-- Genome index: `C:\krep_work\chm13.k18.s16.kidx`
+- Genome indices: `C:\krep_work\chm13.k18.s16.kidx` (contiguous 18-mer,
+  1/16 sampled, 235 MB) and `C:\krep_work\chm13.sp16.s1.kidx` (spaced
+  w16/s22, dense, 560 MB)
 - RepeatMasker BED: `C:\krep_work\chr1_rm.bed` (merged),
   `C:\krep_work\chr1_rm_family.bed` (4-column, for per-family recall)
 - Raw annotation: `~/krep_data/rm.out.gz` (from NCBI FTP, 198 MB)
 - Scratch/temp: `C:\krep_work\tmp` (kept off OneDrive deliberately)
 
-## Build
+## Build and test
 
-WSL cannot host the build (no Rust there, and only 3.9 GB RAM); the Windows
-toolchain works from WSL:
+Windows Application Control intermittently blocks freshly built executables
+(os error 4551) — it hit the test harness and Cargo build scripts, while the
+release `krep.exe` kept running. So:
+
+- **Tests: WSL.** Rust (rustup, minimal) and `build-essential` are installed
+  in WSL. Build on ext4, not `/mnt/c`:
+  `~/.cargo/bin/cargo test --release --target-dir ~/krep_target`
+- **Runs: Windows exe**, because it sees the host's 8 GB rather than WSL's
+  3.9 GB. Build with the Windows toolchain from WSL and copy off OneDrive:
 
 ```bash
 export PATH="/mnt/c/mingw64/bin:$PATH"
 /mnt/c/Users/jfris/.cargo/bin/cargo.exe build --release --target-dir target3
+cp target3/release/krep.exe /mnt/c/krep_work/krep.exe
 ```
 
-Pass Windows-style paths (`C:/...`) to the resulting `.exe`.
+Pass Windows-style paths (`C:/...`) to the `.exe`.

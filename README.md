@@ -71,6 +71,19 @@ krep mask --genome chm13_chr1_unmasked.fa --index chm13.k18.s16.kidx \
 
 # Score against a RepeatMasker .out converted to BED
 krep evaluate --truth chr1_rm.bed --pred chr1.bed
+
+# Optional second index with a spaced seed (weight 16 over 22 bases), densely
+# sampled: ~12 min in 16 passes, 560 MB. Don't-care positions tolerate the
+# substitutions that diverged copies carry.
+krep index --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --seed 1110110110110110110111 --sample 1 --min-count 8 --passes 16 \
+  --out chm13.sp16.s1.kidx
+
+# Union both indices, each with its own threshold, plus a density gate.
+# Best configuration found on chr1 vs RepeatMasker: P 0.749 / R 0.802 / F1 0.775
+krep mask --genome chm13_chr1_unmasked.fa \
+  --index chm13.k18.s16.kidx --index chm13.sp16.s1.kidx --index-threshold 4,64 \
+  --graph-gap 150 --min-hits 2 --min-density 0.03 --out chr1.bed
 ```
 
 `--index-threshold` is a **genome-wide** occurrence count. It is on a completely
@@ -174,8 +187,11 @@ Repeat families in the mock genome: ALU, LINE1, SINE, LTR, MICROSAT, SAT, **SEG_
 | `--assembly` | false | Use de Bruijn graph assembly of high-count k-mers |
 | `--assembly-abundance` | `0` | Minimum component CBF abundance (0 = automatic) |
 | `--cbf-factor` | `8` | CBF size multiplier (`slots = factor × kmers`). Lower = less RAM, more collisions |
-| `--index` | — | Use a genome-wide index (from `krep index`) instead of counting within the input FASTA |
-| `--index-threshold` | `10` | Genome-wide occurrence count required, used with `--index`. Different scale from `--threshold` |
+| `--index` | — | Use a genome-wide index (from `krep index`) instead of counting within the input FASTA. Repeatable; hits from all indices are unioned |
+| `--index-threshold` | `10` | Genome-wide count at which a seed may *nucleate* a region. One value, or one per `--index` (comma-separated) — a spaced seed and a contiguous k-mer sit on different count scales |
+| `--index-threshold-low` | = high | Lower count at which a seed may *extend or bridge* a region a stronger seed nucleated (hysteresis). Weak seeds never start a region |
+| `--min-hits` | `1` | Minimum seed hits in a linked component |
+| `--min-density` | `0` | Minimum hits per base over a linked component. With dense sampling, real copies sit well above 0.1; background clusters do not |
 
 ### `index`
 
@@ -185,7 +201,9 @@ against it.
 | flag | default | meaning |
 |------|---------|---------|
 | `--genome` | – | input FASTA (the whole genome) |
-| `--k` | 18 | k-mer length; needs k >= 17 at 3.1 Gb so random k-mers do not recur by chance |
+| `--k` | 18 | contiguous k-mer length; needs k >= 17 at 3.1 Gb so random k-mers do not recur by chance |
+| `--seed` | – | spaced-seed pattern of 1/0 (care/don't-care), e.g. `1110110110110110110111`; must be symmetric; overrides `--k`. Weight must stay >= 16 at 3.1 Gb or composition background swamps the counts |
+| `--passes` | 1 | stream the genome N times, each counting one hash partition; bounds temp disk and RAM for dense sampling |
 | `--sample` | 16 | keep 1 in N k-mers by hash (power of two); counts stay exact |
 | `--min-count` | 2 | drop k-mers rarer than this genome-wide |
 | `--buffer` | 48000000 | k-mers held in RAM before spilling a run (8 bytes each) |
@@ -265,25 +283,33 @@ a *different de novo masker*, not with RepeatMasker. Download
 
 Masking full chr1 takes **1.8 s** once the index is built.
 
-**Why recall plateaus.** Per-family recall at `t=4, gap=250` splits cleanly by
-family age:
+**Closing the gap: what was tried, with numbers.** Three additions were
+measured on full chr1 against RepeatMasker, all starting from the k18 baseline
+(`t=4 gap=250`, F1 0.766):
 
-| recovered almost fully | recall | | largely missed | recall |
-|---|---|---|---|---|
-| Satellite/acro | 1.000 | | SINE/tRNA | 0.087 |
-| Satellite/centr | 0.999 | | DNA/Crypton | 0.122 |
-| Retroposon/SVA | 0.993 | | LINE/CR1 | 0.202 |
-| SINE/Alu | 0.978 | | LINE/L2 | 0.294 |
-| LTR/ERVK | 0.969 | | SINE/MIR | 0.378 |
-| Simple_repeat | 0.832 | | LTR/ERVL | 0.424 |
-| LINE/L1 | 0.826 | | DNA/hAT-Charlie | 0.507 |
+| change | best config | P | R | F1 | verdict |
+|---|---|---|---|---|---|
+| Hysteresis (`--index-threshold-low`) alone | high 8 / low 3 / gap 250 | 0.702 | 0.834 | 0.762 | no gain: the FP source is *bridging*, not nucleation; weak seeds bridge as freely as strong ones |
+| Spaced seed (w16/s22, `--sample 1`) alone | t 64 / gap 150 / density 0.05 | 0.832 | 0.724 | 0.774 | same F1 as k18, different profile; weight had to stay 16 and threshold rise 16x to beat composition background |
+| **k18@4 ∪ spaced@64 + density gate** | gap 150 / `--min-density 0.03` | **0.749** | **0.802** | **0.775** | best found; +3.7 recall points |
 
-**54% of all missed bases** on chr1 are ancient, highly diverged families
-(L2, MIR, CR1, Helitron, DNA transposons). RepeatMasker finds these by aligning
-to a curated Dfam consensus; a 30%-diverged MIR copy shares essentially no exact
-18-mers with any other copy, so *no* k-mer-abundance method can recover it. This
-is a structural ceiling, not a tuning problem — closing it requires consensus
-building plus alignment, not a different threshold.
+Per-family recall, k18 baseline → union:
+
+| family | before | after | | family | before | after |
+|---|---|---|---|---|---|---|
+| Simple_repeat | 0.832 | 0.938 | | SINE/MIR | 0.378 | 0.468 |
+| SINE/Alu | 0.978 | 0.999 | | DNA/hAT-Charlie | 0.507 | 0.593 |
+| LINE/L1 | 0.826 | 0.888 | | LINE/CR1 | 0.202 | 0.232 |
+| DNA/TcMar-Tigger | 0.741 | 0.804 | | LINE/L2 | 0.294 | 0.309 |
+
+Every configuration converges on F1 ≈ 0.775. That is the ceiling of
+copy-vs-copy k-mer abundance on this genome, and it is structural:
+RepeatMasker aligns each copy to a curated Dfam *consensus*, which is far
+closer to every copy than any two copies are to each other. A 30%-diverged
+MIR copy shares essentially no exact seed with any other copy at the weight a
+3.1 Gb genome demands. L2 barely moved (0.294 → 0.309) no matter what. Closing
+the remaining gap needs consensus building plus alignment — or a library — not
+another threshold.
 
 ### Memory notes for large genomes
 
@@ -299,6 +325,11 @@ are tracked, which shrinks the table by `sample` without biasing counts: the
 decision depends solely on the k-mer's own hash, so a tracked k-mer is counted at
 every occurrence and its stored count is exact. `--graph-gap` must comfortably
 exceed the sampling stride so sparse seeds still link (gap 250 with sample 16).
+
+**Dense sampling.** `--sample 1` with a spaced seed produces 3.1e9 seed
+instances; `--passes 16` keeps each pass at ~2.3 GB of temp and one buffer of
+RAM. Retained entries are held in RAM across passes (12 bytes each), so pair
+dense sampling with a higher `--min-count` (8 gave 47M entries / 560 MB).
 
 **Without an index (legacy per-record counting).** The CBF is sized
 `genome_size x cbf_factor` bytes and is rebuilt per record, so a single human

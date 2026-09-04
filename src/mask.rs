@@ -6,7 +6,7 @@
 
 use crate::bitvec::BitVec;
 use crate::cbf::CountingBloomFilter;
-use crate::kmer::{self, KmerIter};
+use crate::kmer::{self, KmerIter, SeedIter};
 use crate::rng::Rng;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -679,88 +679,159 @@ mod tests {
 // Index-driven masking
 // ---------------------------------------------------------------------------
 
-/// Mask one record using **genome-wide** k-mer counts from a prebuilt index.
+/// One seed hit while masking against an index.
+#[derive(Clone, Copy, Debug)]
+struct SeedHit {
+    /// Window start.
+    pos: u32,
+    /// Window end (exclusive) — `pos + span` of the index that produced it.
+    end: u32,
+    /// Count reached the nucleation threshold, not just the extension one.
+    strong: bool,
+}
+
+/// Mask one record using **genome-wide** seed counts from prebuilt indices.
 ///
 /// This is the counterpart to `mask_fasta_graph`, with one crucial difference:
-/// the abundance of every k-mer was measured across the entire genome rather
+/// the abundance of every seed was measured across the entire genome rather
 /// than across whichever record happens to be in memory. A family with a few
 /// hundred copies genome-wide is therefore visible even when the target is a
 /// single chromosome or a 10 Mb slice.
 ///
-/// Because the index only stores a hash sample of k-mer space, seeds are sparse
-/// (roughly one per `sample` bases inside a repeat). `max_gap` links them back
-/// into contiguous blocks, so it must comfortably exceed the sampling stride.
+/// Several indices may be supplied (say a contiguous 18-mer index and a
+/// spaced-seed index); their hits are unioned before linking.
+///
+/// **Hysteresis.** A single count threshold cannot serve two jobs at once: low
+/// enough to follow a repeat copy through its mutated stretches, yet high
+/// enough that random near-unique seeds do not nucleate regions of their own.
+/// So there are two. Seeds at or above `t_low` are collected and linked within
+/// `max_gap`; a linked component is kept only if it contains at least one seed
+/// at or above `t_high`. Weak seeds extend and bridge, never nucleate. With
+/// `t_high == t_low` this reduces to the plain single-threshold linker.
+///
+/// Because indices may store only a hash sample of seed space, hits can be
+/// sparse (roughly one per `sample` bases inside a repeat). `max_gap` links
+/// them back into contiguous blocks, so it must comfortably exceed the
+/// sampling stride.
+///
+/// **Density.** With dense sampling (every position tested) a genuine repeat
+/// copy produces hits at a large fraction of its positions, while a cluster of
+/// composition-biased background seeds does not. A component is kept only if
+/// it has at least `min_hits` hits and at least `min_density` hits per base;
+/// `min_hits = 1, min_density = 0.0` disables the filter.
+#[allow(clippy::too_many_arguments)]
 pub fn mask_sequence_indexed(
     chrom: &str,
     seq: &[u8],
-    idx: &crate::index::KmerIndex,
-    threshold: u32,
+    indices: &[crate::index::KmerIndex],
+    thresholds: &[(u32, u32)],
     max_gap: usize,
     min_len: usize,
+    min_hits: usize,
+    min_density: f64,
 ) -> Vec<MaskedRegion> {
-    let k = idx.k;
-    let n_starts = seq.len().saturating_sub(k.saturating_sub(1));
-    if n_starts == 0 {
-        return Vec::new();
-    }
+    assert_eq!(
+        indices.len(),
+        thresholds.len(),
+        "one (t_high, t_low) pair per index"
+    );
+    let mut hits: Vec<SeedHit> = Vec::new();
 
-    // Disjoint k-mer start ranges, so every position is tested exactly once.
-    let block = (n_starts.div_ceil(rayon::current_num_threads().max(1))).max(1 << 20);
-    let mut bounds = Vec::new();
-    let mut b = 0usize;
-    while b < n_starts {
-        bounds.push((b, (b + block).min(n_starts)));
-        b += block;
-    }
+    for (idx, &(t_high, t_low)) in indices.iter().zip(thresholds) {
+        // A count of 0 means "absent from the index" (below its min_count),
+        // never "occurs zero times" — so neither threshold may reach 0, or
+        // every seed outside the table would register as a hit. The extension
+        // threshold also cannot exceed the nucleation one. Thresholds are per
+        // index because a weight-16 spaced seed and a contiguous 18-mer sit on
+        // very different count scales in the same genome.
+        let t_high = t_high.max(1);
+        let t_low = t_low.clamp(1, t_high);
+        let span = idx.span();
+        let n_starts = seq.len().saturating_sub(span.saturating_sub(1));
+        if n_starts == 0 {
+            continue;
+        }
 
-    let parts: Vec<Vec<u32>> = bounds
-        .into_par_iter()
-        .map(|(bs, be)| {
-            let hi = (be + k - 1).min(seq.len());
-            let mut hits = Vec::new();
-            for (pos, kmer) in KmerIter::new(&seq[bs..hi], k) {
-                if idx.sampled(kmer) && idx.count(kmer) >= threshold {
-                    hits.push((bs + pos) as u32);
+        // Disjoint seed start ranges, so every position is tested exactly once.
+        let block = (n_starts.div_ceil(rayon::current_num_threads().max(1))).max(1 << 20);
+        let mut bounds = Vec::new();
+        let mut b = 0usize;
+        while b < n_starts {
+            bounds.push((b, (b + block).min(n_starts)));
+            b += block;
+        }
+
+        let parts: Vec<Vec<SeedHit>> = bounds
+            .into_par_iter()
+            .map(|(bs, be)| {
+                let hi = (be + span - 1).min(seq.len());
+                let mut local = Vec::new();
+                for (pos, kmer) in SeedIter::new(&seq[bs..hi], &idx.seed) {
+                    if !idx.sampled(kmer) {
+                        continue;
+                    }
+                    let c = idx.count(kmer);
+                    if c >= t_low {
+                        let p = bs + pos;
+                        local.push(SeedHit {
+                            pos: p as u32,
+                            end: (p + span).min(seq.len()) as u32,
+                            strong: c >= t_high,
+                        });
+                    }
                 }
-            }
-            hits
-        })
-        .collect();
-
-    let mut positions: Vec<u32> = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
-    for p in parts {
-        positions.extend_from_slice(&p);
+                local
+            })
+            .collect();
+        for p in parts {
+            hits.extend_from_slice(&p);
+        }
     }
-    if positions.is_empty() {
+    if hits.is_empty() {
         return Vec::new();
     }
+    // A single index yields hits already in order; the union of several
+    // interleaves and must be sorted.
+    if indices.len() > 1 {
+        hits.par_sort_unstable_by_key(|h| h.pos);
+    }
+    debug_assert!(hits.windows(2).all(|w| w[0].pos <= w[1].pos));
 
-    // Blocks are emitted in ascending order and are disjoint, so `positions` is
-    // already sorted; this is a cheap guard rather than a real sort.
-    debug_assert!(positions.windows(2).all(|w| w[0] <= w[1]));
-
+    let chrom_id = crate::fasta::seq_id(chrom);
     let mut regions = Vec::new();
-    let mut comp_start = positions[0] as usize;
-    let mut comp_last = positions[0] as usize;
-    let mut push = |s: usize, last: usize, out: &mut Vec<MaskedRegion>| {
-        let e = (last + k).min(seq.len());
-        if e - s >= min_len {
+    let mut comp_start = hits[0].pos as usize;
+    let mut comp_end = hits[0].end as usize;
+    let mut comp_last = hits[0].pos as usize;
+    let mut comp_strong = hits[0].strong;
+    let mut comp_hits = 1usize;
+
+    let mut close = |s: usize, e: usize, strong: bool, n: usize, out: &mut Vec<MaskedRegion>| {
+        let len = e - s;
+        if strong && len >= min_len && n >= min_hits && n as f64 >= min_density * len as f64 {
             out.push(MaskedRegion {
-                chrom: crate::fasta::seq_id(chrom).to_string(),
+                chrom: chrom_id.to_string(),
                 start: s,
                 end: e,
             });
         }
     };
-    for &pos in positions.iter().skip(1) {
-        let pos = pos as usize;
+
+    for h in hits.iter().skip(1) {
+        let pos = h.pos as usize;
         if pos > comp_last + max_gap {
-            push(comp_start, comp_last, &mut regions);
+            close(comp_start, comp_end, comp_strong, comp_hits, &mut regions);
             comp_start = pos;
+            comp_end = h.end as usize;
+            comp_strong = h.strong;
+            comp_hits = 1;
+        } else {
+            comp_end = comp_end.max(h.end as usize);
+            comp_strong |= h.strong;
+            comp_hits += 1;
         }
         comp_last = pos;
     }
-    push(comp_start, comp_last, &mut regions);
+    close(comp_start, comp_end, comp_strong, comp_hits, &mut regions);
 
     regions
 }
@@ -772,5 +843,122 @@ pub fn apply_soft_mask(seq: &mut [u8], regions: &[MaskedRegion]) {
         for b in &mut seq[r.start.min(len)..r.end.min(len)] {
             b.make_ascii_lowercase();
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod hysteresis_tests {
+    use super::*;
+    use crate::index::{self, KmerIndex};
+    use crate::kmer::SpacedSeed;
+    use std::fs::{self, File};
+    use std::io::Write;
+
+    /// Genome: unique flank, a 300 bp unit x 10 (strong), unique spacer, a
+    /// 300 bp unit x 3 (weak), unique flank. Returns (path, seq, offsets).
+    pub(super) fn build_fixture(name: &str) -> (KmerIndex, Vec<u8>, (usize, usize, usize, usize)) {
+        // Tests run concurrently, so each gets its own scratch directory.
+        let dir = std::env::temp_dir().join(format!("krep_hysteresis_{}", name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let rnd = |salt: u64, n: usize| -> Vec<u8> {
+            (0..n as u64)
+                .map(|i| b"ACGT"[(index::splitmix64(i ^ salt) % 4) as usize])
+                .collect()
+        };
+        let strong_unit = rnd(0x1111, 300);
+        let weak_unit = rnd(0x2222, 300);
+
+        let mut seq = rnd(0xaaaa, 2000);
+        let strong_start = seq.len();
+        for _ in 0..10 {
+            seq.extend_from_slice(&strong_unit);
+        }
+        let strong_end = seq.len();
+        seq.extend_from_slice(&rnd(0xbbbb, 2000));
+        let weak_start = seq.len();
+        for _ in 0..3 {
+            seq.extend_from_slice(&weak_unit);
+        }
+        let weak_end = seq.len();
+        seq.extend_from_slice(&rnd(0xcccc, 2000));
+
+        let fa = dir.join("h.fa");
+        {
+            let mut f = File::create(&fa).unwrap();
+            writeln!(f, ">chrH").unwrap();
+            f.write_all(&seq).unwrap();
+            writeln!(f).unwrap();
+        }
+        let out = dir.join("h.kidx");
+        index::build(&fa, &SpacedSeed::contiguous(15), 1, 2, 1 << 16, 1, &dir, &out, false)
+            .unwrap();
+        let idx = KmerIndex::load(&out).unwrap();
+        (idx, seq, (strong_start, strong_end, weak_start, weak_end))
+    }
+
+    fn covered(regions: &[MaskedRegion], s: usize, e: usize) -> usize {
+        regions
+            .iter()
+            .map(|r| r.end.min(e).saturating_sub(r.start.max(s)))
+            .sum()
+    }
+
+    #[test]
+    fn weak_seeds_never_nucleate() {
+        let (idx, seq, (ss, se, ws, we)) = build_fixture("nucleate");
+        let idxs = [idx];
+        // t_high=8 (only the x10 array qualifies), t_low=3 (the x3 array has
+        // count 3 and would pass a single threshold of 3).
+        let regions = mask_sequence_indexed("chrH", &seq, &idxs, &[(8, 3)], 50, 30, 1, 0.0);
+        assert!(covered(&regions, ss, se) > (se - ss) * 9 / 10, "strong array masked");
+        assert_eq!(covered(&regions, ws, we), 0, "weak-only array must not nucleate");
+
+        // Sanity: a plain low threshold *would* mask the weak array.
+        let plain = mask_sequence_indexed("chrH", &seq, &idxs, &[(3, 3)], 50, 30, 1, 0.0);
+        assert!(covered(&plain, ws, we) > (we - ws) * 9 / 10);
+    }
+
+    #[test]
+    fn equal_thresholds_match_plain_linking() {
+        let (idx, seq, _) = build_fixture("equal");
+        let idxs = [idx];
+        let a = mask_sequence_indexed("chrH", &seq, &idxs, &[(5, 5)], 50, 30, 1, 0.0);
+        // t_low above t_high is clamped down to it, so 7 behaves as 5.
+        let b = mask_sequence_indexed("chrH", &seq, &idxs, &[(5, 7)], 50, 30, 1, 0.0);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!((x.start, x.end), (y.start, y.end));
+        }
+        // A t_low of 0 must not turn absent seeds (count 0) into hits: the
+        // unique flanks stay unmasked.
+        let c = mask_sequence_indexed("chrH", &seq, &idxs, &[(5, 0)], 50, 30, 1, 0.0);
+        assert!(covered(&c, 0, 1900) == 0, "unique flank must stay unmasked");
+    }
+}
+
+#[cfg(test)]
+mod density_tests {
+    use super::*;
+
+    #[test]
+    fn density_filter_drops_sparse_components() {
+        // Build hits by hand through the public path is awkward; instead reuse
+        // the hysteresis fixture and assert the filter's monotonicity: a
+        // demanding density must never mask *more* than a permissive one.
+        let (idx, seq, (ss, se, _, _)) = super::hysteresis_tests::build_fixture("density");
+        let idxs = [idx];
+        let loose = mask_sequence_indexed("chrH", &seq, &idxs, &[(5, 5)], 50, 30, 1, 0.0);
+        let tight = mask_sequence_indexed("chrH", &seq, &idxs, &[(5, 5)], 50, 30, 50, 0.5);
+        let total = |r: &[MaskedRegion]| r.iter().map(|x| x.end - x.start).sum::<usize>();
+        assert!(total(&tight) <= total(&loose));
+        // The x10 array is hit at every sampled position (sample=1), so it
+        // survives even a strict density requirement.
+        let cov: usize = tight
+            .iter()
+            .map(|r| r.end.min(se).saturating_sub(r.start.max(ss)))
+            .sum();
+        assert!(cov > (se - ss) * 9 / 10, "dense true repeat must survive density filter");
     }
 }

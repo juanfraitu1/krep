@@ -140,11 +140,36 @@ enum Commands {
         /// completely different scale from the per-slice counts, so it must be
         /// retuned rather than carried over.
         #[arg(long, value_name = "FILE")]
-        index: Option<PathBuf>,
+        index: Vec<PathBuf>,
 
-        /// Genome-wide occurrence threshold used with `--index`.
-        #[arg(long, default_value_t = 10)]
-        index_threshold: u32,
+        /// Genome-wide occurrence count at which a seed may *nucleate* a masked
+        /// region (used with `--index`). Repeat `--index` to union several
+        /// indices, e.g. a contiguous 18-mer index plus a spaced-seed index.
+        /// Give one value, or one per --index (comma-separated, same order)
+        /// since a spaced seed and a contiguous k-mer sit on different count
+        /// scales.
+        #[arg(long, value_delimiter = ',', default_value = "10")]
+        index_threshold: Vec<u32>,
+
+        /// Lower count at which a seed may *extend or bridge* a region that a
+        /// stronger seed already nucleated. Weak seeds never start a region on
+        /// their own, so this can sit well below --index-threshold without
+        /// flooding false positives. Defaults to --index-threshold (no
+        /// hysteresis).
+        #[arg(long, value_name = "COUNT", value_delimiter = ',')]
+        index_threshold_low: Option<Vec<u32>>,
+
+        /// Minimum number of seed hits a linked component needs to be masked
+        /// (used with `--index`). With dense sampling, background clusters of
+        /// composition-biased seeds have few hits; real copies have many.
+        #[arg(long, default_value_t = 1)]
+        min_hits: usize,
+
+        /// Minimum hits per base over a linked component (used with `--index`).
+        /// 0 disables. With `--sample 1` a real repeat copy sits well above
+        /// 0.1; try 0.05-0.2.
+        #[arg(long, default_value_t = 0.0)]
+        min_density: f64,
 
         /// Counting Bloom filter size multiplier: number of CBF slots is
         /// `factor × number_of_kmers`. Lower values reduce memory but increase
@@ -164,10 +189,25 @@ enum Commands {
         #[arg(short, long)]
         genome: PathBuf,
 
-        /// k-mer length. At genome scale k must be large enough that a random
-        /// k-mer is not expected to recur by chance (k >= 17 for 3.1 Gb).
+        /// k-mer length for a contiguous seed. At genome scale k must be large
+        /// enough that a random k-mer is not expected to recur by chance
+        /// (k >= 17 for 3.1 Gb). Ignored when --seed is given.
         #[arg(short, long, default_value_t = 18)]
         k: usize,
+
+        /// Spaced-seed pattern of 1 (care) and 0 (don't-care), e.g.
+        /// 11011011011011011011 (weight 14, span 20). Don't-care positions
+        /// absorb substitutions, which is what recovers ancient diverged
+        /// families (MIR, L2, DNA transposons) that share almost no exact
+        /// 18-mers between copies. Must be symmetric. Overrides --k.
+        #[arg(long, value_name = "PATTERN")]
+        seed: Option<String>,
+
+        /// Stream the genome this many times, each pass counting one hash
+        /// partition of seed space. Bounds temp disk and buffer pressure for
+        /// dense sampling (--sample 1 or 2) at the cost of extra sequential I/O.
+        #[arg(long, default_value_t = 1)]
+        passes: usize,
 
         /// Keep 1 in SAMPLE k-mers, chosen by hash. Must be a power of two.
         /// Sampling shrinks the table without biasing counts: a sampled k-mer
@@ -379,21 +419,44 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         assembly,
         assembly_abundance,
         cbf_factor,
-        index: index_path,
+        index: index_paths,
         index_threshold,
+        index_threshold_low,
+        min_hits,
+        min_density,
     } = args
     else {
         unreachable!()
     };
 
     // Index-driven path: stream the target, look up genome-wide counts.
-    if let Some(idx_path) = index_path {
+    if !index_paths.is_empty() {
+        let broadcast = |v: &Vec<u32>, name: &str| -> Result<Vec<u32>, String> {
+            match v.len() {
+                1 => Ok(vec![v[0]; index_paths.len()]),
+                n if n == index_paths.len() => Ok(v.clone()),
+                n => Err(format!(
+                    "{} has {} values but there are {} --index files",
+                    name,
+                    n,
+                    index_paths.len()
+                )),
+            }
+        };
+        let highs = broadcast(index_threshold, "--index-threshold")?;
+        let lows = match index_threshold_low {
+            Some(v) => broadcast(v, "--index-threshold-low")?,
+            None => highs.clone(),
+        };
+        let thresholds: Vec<(u32, u32)> = highs.into_iter().zip(lows).collect();
         return run_mask_indexed(
             genome,
-            idx_path,
-            *index_threshold,
+            index_paths,
+            &thresholds,
             *graph_gap,
             *min_len,
+            *min_hits,
+            *min_density,
             out,
             out_format,
             soft.as_deref(),
@@ -819,6 +882,8 @@ fn run_index(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     let Commands::Index {
         genome,
         k,
+        seed,
+        passes,
         sample,
         min_count,
         buffer,
@@ -830,27 +895,35 @@ fn run_index(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         unreachable!()
     };
 
+    let seed = match seed {
+        Some(p) => kmer::SpacedSeed::parse(p)?,
+        None => kmer::SpacedSeed::contiguous(*k),
+    };
+
     let t0 = Instant::now();
     println!(
-        "Indexing {} with k={}, sample=1/{}, min_count={} ...",
+        "Indexing {} with seed {} (span {}, weight {}), sample=1/{}, min_count={}, passes={} ...",
         genome.display(),
-        k,
+        seed.pattern(),
+        seed.span(),
+        seed.weight(),
         sample,
-        min_count
+        min_count,
+        passes
     );
     let stats = index::build(
-        genome, *k, *sample, *min_count, *buffer, tmp_dir, out, *verbose,
+        genome, &seed, *sample, *min_count, *buffer, *passes, tmp_dir, out, *verbose,
     )?;
 
     println!("\nRecords:            {}", stats.records);
     println!("Bases:              {}", stats.bases);
-    println!("K-mers seen:        {}", stats.total_kmers);
+    println!("Seeds seen:         {}", stats.total_kmers);
     println!(
-        "K-mers sampled:     {} (1/{:.1})",
+        "Seeds sampled:      {} (1/{:.1})",
         stats.sampled_kmers,
         stats.total_kmers as f64 / stats.sampled_kmers.max(1) as f64
     );
-    println!("Sorted runs:        {}", stats.runs);
+    println!("Sorted runs:        {} over {} pass(es)", stats.runs, stats.passes);
     println!(
         "Index entries:      {} ({:.0} MB resident)",
         stats.entries,
@@ -863,10 +936,12 @@ fn run_index(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_mask_indexed(
     genome: &PathBuf,
-    idx_path: &PathBuf,
-    threshold: u32,
+    idx_paths: &[PathBuf],
+    thresholds: &[(u32, u32)],
     max_gap: usize,
     min_len: usize,
+    min_hits: usize,
+    min_density: f64,
     out: &PathBuf,
     out_format: &OutputFormat,
     soft: Option<&std::path::Path>,
@@ -874,28 +949,40 @@ fn run_mask_indexed(
     use std::time::Instant;
 
     let t0 = Instant::now();
-    let idx = index::KmerIndex::load(idx_path)?;
-    println!(
-        "Loaded index: k={}, sample=1/{}, {} entries ({:.0} MB), min_count={}",
-        idx.k,
-        idx.sample,
-        idx.len(),
-        idx.memory_bytes() as f64 / 1e6,
-        idx.min_count
-    );
-    if threshold < idx.min_count {
-        eprintln!(
-            "warning: --index-threshold {} is below the index min_count {}; \
-             k-mers rarer than {} were discarded at build time and read as count 0",
-            threshold, idx.min_count, idx.min_count
+    let mut indices = Vec::with_capacity(idx_paths.len());
+    for (p, &(t_high, t_low)) in idx_paths.iter().zip(thresholds) {
+        let idx = index::KmerIndex::load(p)?;
+        println!(
+            "Loaded {}: seed {} (span {}, weight {}), sample=1/{}, {} entries ({:.0} MB), min_count={}",
+            p.display(),
+            idx.seed.pattern(),
+            idx.span(),
+            idx.seed.weight(),
+            idx.sample,
+            idx.len(),
+            idx.memory_bytes() as f64 / 1e6,
+            idx.min_count
         );
-    }
-    if max_gap < idx.sample as usize {
-        eprintln!(
-            "warning: --graph-gap {} is smaller than the sampling stride {}; \
-             seeds will not link into regions",
-            max_gap, idx.sample
-        );
+        if t_low < idx.min_count {
+            eprintln!(
+                "warning: threshold {} is below this index's min_count {}; \
+                 seeds rarer than {} were discarded at build time and read as count 0",
+                t_low, idx.min_count, idx.min_count
+            );
+        }
+        if max_gap < idx.sample as usize {
+            eprintln!(
+                "warning: --graph-gap {} is smaller than the sampling stride {}; \
+                 seeds will not link into regions",
+                max_gap, idx.sample
+            );
+        }
+        if t_low < t_high {
+            println!("  nucleate at count >= {}, extend at count >= {}", t_high, t_low);
+        } else {
+            println!("  threshold: count >= {}", t_high);
+        }
+        indices.push(idx);
     }
 
     let mut stream = fasta::FastaStream::open(genome)?;
@@ -909,8 +996,10 @@ fn run_mask_indexed(
     let mut total_masked = 0u64;
 
     while let Some(mut rec) = stream.next_record(true)? {
-        let regions =
-            mask::mask_sequence_indexed(&rec.header, &rec.seq, &idx, threshold, max_gap, min_len);
+        let regions = mask::mask_sequence_indexed(
+            &rec.header, &rec.seq, &indices, thresholds, max_gap, min_len, min_hits,
+            min_density,
+        );
         let masked: usize = regions.iter().map(|r| r.end - r.start).sum();
         println!(
             "  {:<18} {:>12} bp  {:>8} regions  {:>6.2}% masked",
