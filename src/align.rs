@@ -29,6 +29,8 @@ const CHAIN_WINDOW: usize = 64;
 const CHAIN_DIAG: i64 = 3;
 /// Recent hits remembered per oriented consensus.
 const SLOTS: usize = 2;
+/// Single-hit mode: bases skipped after a failed extension.
+const SINGLE_HIT_COOLDOWN: usize = 8;
 
 pub struct Library {
     pub names: Vec<String>,
@@ -44,6 +46,10 @@ pub struct Library {
     pub min_score: i32,
     pub band: usize,
     pub xdrop: i32,
+    /// Trigger extension on every seed hit (gated by the ungapped check)
+    /// instead of requiring two hits on one diagonal. Far more sensitive to
+    /// short diverged fragments; costs ~1 µs per genome position.
+    pub single_hit: bool,
 }
 
 fn revcomp(seq: &[u8]) -> Vec<u8> {
@@ -154,6 +160,7 @@ impl Library {
             min_score,
             band,
             xdrop,
+            single_hit: false,
         })
     }
 
@@ -207,6 +214,10 @@ impl Library {
         // weight is thousands of comparisons per genome position.
         let mut last: Vec<[(u32, i64, u32); SLOTS]> =
             vec![[(u32::MAX, 0, 0); SLOTS]; self.seqs.len()];
+        // Single-hit mode: last failed (genome pos, diagonal) per consensus,
+        // and a global pause after any failed extension.
+        let mut failed: Vec<(u32, i64)> = vec![(u32::MAX, 0); self.seqs.len()];
+        let mut cooldown_until = 0usize;
         let mut masked_until = 0usize;
         let (mut fwd, mut valid) = (0u64, 0usize);
 
@@ -233,6 +244,43 @@ impl Library {
             let lo = self.table[v as usize] as usize;
             let hi = self.table[v as usize + 1] as usize;
             if lo == hi || !complex_enough(v, weight) {
+                continue;
+            }
+
+            if self.single_hit {
+                if g < cooldown_until {
+                    continue;
+                }
+                for &(oi, cpos) in &self.entries[lo..hi] {
+                    let diag = g as i64 - cpos as i64;
+                    // A diagonal that just failed to extend will fail again a
+                    // few bases on; without this memo a region weakly similar
+                    // to some consensus triggers a full DP at every position.
+                    let (fg, fd) = failed[oi as usize];
+                    if fg != u32::MAX && (fg as usize) + CHAIN_WINDOW >= g && (fd - diag).abs() <= CHAIN_DIAG {
+                        continue;
+                    }
+                    if let Some((start, end, score)) =
+                        self.extend_hit(seq, oi as usize, cpos as usize, g)
+                    {
+                        regions.push(MaskedRegion {
+                            chrom: chrom.to_string(),
+                            start,
+                            end,
+                            name: format!("{}:{}", self.names[oi as usize / 2], score),
+                        });
+                        masked_until = end;
+                        break;
+                    }
+                    failed[oi as usize] = (g as u32, diag);
+                    // Sub-threshold genuine similarity (ancient debris against
+                    // a related consensus) is where single-hit mode spends its
+                    // time: the gate passes, the DP fails, and the next base
+                    // offers another entry on another diagonal. A real
+                    // fragment has several seed hits, so pausing a few bases
+                    // after any failed DP costs little sensitivity.
+                    cooldown_until = g + SINGLE_HIT_COOLDOWN;
+                }
                 continue;
             }
 
@@ -286,14 +334,23 @@ impl Library {
         {
             let left = cpos.min(gpos).min(32);
             let right = (cons.len() - cpos).min(seq.len() - gpos).min(32);
-            let mut s = 0i32;
+            let (mut sl, mut sr) = (0i32, 0i32);
             for o in 0..left {
-                s += if cons[cpos - 1 - o] == seq[gpos - 1 - o] { MATCH } else { MISMATCH };
+                sl += if cons[cpos - 1 - o] == seq[gpos - 1 - o] { MATCH } else { MISMATCH };
             }
             for o in 0..right {
-                s += if cons[cpos + o] == seq[gpos + o] { MATCH } else { MISMATCH };
+                sr += if cons[cpos + o] == seq[gpos + o] { MATCH } else { MISMATCH };
             }
-            if s < -8 {
+            // Either side may be broken by an indel, so accept on the sum or
+            // on one side alone. In single-hit mode this gate is the only
+            // thing standing between every seed hit and a banded DP, so it
+            // is stricter: random sequence averages -16 per side.
+            let pass = if self.single_hit {
+                sl + sr >= 4 || sl >= 6 || sr >= 6
+            } else {
+                sl + sr >= -8
+            };
+            if !pass {
                 return None;
             }
         }

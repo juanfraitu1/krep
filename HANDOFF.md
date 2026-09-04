@@ -159,6 +159,36 @@ Note: whole-genome runs launched from this harness as background tasks were
 killed once mid-run; `run_genome.sh` relaunches it detached
 (`setsid nohup`) and polls the log for `ALL_DONE`.
 
+## Round 4: Dfam hybrid, single-hit aligner, tandem + DUST
+
+- **Dfam diagnostic** (1,403 human consensi via the Dfam API, CC0): through
+  krep's aligner alone P 0.994 / R 0.806 / F1 0.890 on chr1. Mid-age families
+  jump (ERVL 0.50→0.81, Tip100 0.17→0.62, Helitron 0.02→0.53, Charlie
+  0.51→0.70) — consensus quality was their limit. MIR (0.38) and L2 (0.27)
+  barely move even with RepeatMasker's own consensi — the aligner's two-hit
+  chain is their limit. Best hybrid: k18@32 + Dfam + tandem = F1 0.8915.
+- **`--lib-single-hit`**: extension on every seed hit, gated by a stricter
+  ungapped check (sum ≥ 4 or one side ≥ 6), with a per-consensus failed-
+  diagonal memo and a global 8-base cooldown after any failed DP (without
+  the memo a weakly similar region re-triggered a full DP at every position;
+  the first attempt ran >50 min on chr1). Dfam-only, chr1: P 0.990 /
+  R 0.834 / F1 0.905 (chained: 0.890); MIR 0.44, L2 0.35, CR1 0.30,
+  Helitron 0.67. 1,771 s before the cooldown.
+- **`--tandem`** (`src/tandem.rs`): fixed-period k-mer recurrence runs +
+  periodic identity. k=5, density 0.25, min len 20 is the swept optimum
+  (Simple_repeat 0.435, P 0.90 alone). Most misses are wobbly-period
+  low-complexity (`CAAACAAAACAAAC…`), hence:
+- **`--dust`**: DUST triplet skew. Scale on chr1: random 0.5, wobbly
+  microsat 3–5, (CA)n 15, poly-A 31 — so NCBI's "20" is not the right number
+  here; 5 is conservative, 3 masks more at P 0.74. tandem+dust(5):
+  Simple_repeat 0.50, Low_complexity 0.30, P 0.88.
+- **NCBI-style mode** (index@6 + tandem + dust 3) vs NCBI lowercase on chr1:
+  F1 0.788 (RM-oriented config: 0.757). Closer replication would need
+  WindowMasker's actual two-threshold window scoring.
+
+Data: `C:\krep_work\dfam_human.fa` (1,403 consensi, headers `name#accession`),
+`krep_plus_dfam.fa` (v2 + Dfam concatenated).
+
 ## What would still move it
 
 - **CR1 / Helitron / Tip100 have no usable consensi** (recall ≈ 0). Their

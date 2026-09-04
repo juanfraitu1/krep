@@ -9,6 +9,7 @@ mod kmer;
 mod mask;
 mod mock;
 mod rng;
+mod tandem;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
@@ -197,6 +198,58 @@ enum Commands {
         /// the cost of more spurious chains.
         #[arg(long, default_value = "111010010100110111")]
         lib_seed: String,
+
+        /// Trigger a library alignment on every seed hit (gated by an ungapped
+        /// check) rather than two hits on one diagonal. Much more sensitive
+        /// to short diverged fragments (MIR, L2); slower.
+        #[arg(long, default_value_t = false)]
+        lib_single_hit: bool,
+
+        /// Also detect tandem repeats (Tandem Repeats Finder-style): k-mer
+        /// recurrence at a fixed period, verified by periodic self-identity.
+        /// Supplies the TRF half of an NCBI-style mask and lifts
+        /// Simple_repeat / Low_complexity agreement with RepeatMasker.
+        #[arg(long, default_value_t = false)]
+        tandem: bool,
+
+        /// Largest tandem period considered.
+        #[arg(long, default_value_t = 500)]
+        tandem_max_period: usize,
+
+        /// Shortest tandem array reported.
+        #[arg(long, default_value_t = 20)]
+        tandem_min_len: usize,
+
+        /// Minimum fraction of positions agreeing with the base one period back.
+        #[arg(long, default_value_t = 0.7)]
+        tandem_identity: f64,
+
+        /// k-mer length for tandem recurrence detection (4-8). Shorter k
+        /// tolerates imperfect microsatellites; the fixed-period density gate
+        /// keeps random recurrence out.
+        #[arg(long, default_value_t = 5)]
+        tandem_k: usize,
+
+        /// Minimum fraction of positions (beyond the first copy) whose k-mer
+        /// recurs at the run's period.
+        #[arg(long, default_value_t = 0.25)]
+        tandem_density: f64,
+
+        /// Also mask low-complexity sequence (DUST-style triplet-skew score
+        /// over a sliding window), the other half of an NCBI-style mask.
+        #[arg(long, default_value_t = false)]
+        dust: bool,
+
+        /// DUST score threshold. On krep's scale random sequence scores ~0.5,
+        /// wobbly period-3/4 microsatellites 3-5, a perfect (CA)n ~15, a
+        /// homopolymer ~31. 5 is conservative; 3 masks more low-complexity
+        /// sequence at a precision cost.
+        #[arg(long, default_value_t = 5.0)]
+        dust_threshold: f64,
+
+        /// DUST window in bases.
+        #[arg(long, default_value_t = 64)]
+        dust_window: usize,
 
         /// Counting Bloom filter size multiplier: number of CBF slots is
         /// `factor × number_of_kmers`. Lower values reduce memory but increase
@@ -518,13 +571,34 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         lib_band,
         lib_xdrop,
         lib_seed,
+        lib_single_hit,
+        tandem,
+        tandem_max_period,
+        tandem_min_len,
+        tandem_identity,
+        tandem_k,
+        tandem_density,
+        dust,
+        dust_threshold,
+        dust_window,
     } = args
     else {
         unreachable!()
     };
 
     // Streaming path: genome-wide index lookups and/or library alignment.
-    if !index_paths.is_empty() || library.is_some() {
+    if !index_paths.is_empty() || library.is_some() || *tandem || *dust {
+        let tandem_params = if *tandem {
+            Some(tandem::TandemParams {
+                k: (*tandem_k).clamp(4, 8),
+                max_period: *tandem_max_period,
+                min_len: *tandem_min_len,
+                min_identity: *tandem_identity,
+                min_density: *tandem_density,
+            })
+        } else {
+            None
+        };
         let broadcast = |v: &Vec<u32>, name: &str| -> Result<Vec<u32>, String> {
             match v.len() {
                 1 => Ok(vec![v[0]; index_paths.len()]),
@@ -538,7 +612,11 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let lib = match library {
-            Some(p) => Some(align::Library::load_with_seed(p, lib_seed, *lib_min_score, *lib_band, *lib_xdrop)?),
+            Some(p) => {
+                let mut l = align::Library::load_with_seed(p, lib_seed, *lib_min_score, *lib_band, *lib_xdrop)?;
+                l.single_hit = *lib_single_hit;
+                Some(l)
+            }
             None => None,
         };
         let highs = if index_paths.is_empty() { Vec::new() } else { broadcast(index_threshold, "--index-threshold")? };
@@ -556,6 +634,8 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             *min_hits,
             *min_density,
             lib.as_ref(),
+            tandem_params,
+            if *dust { Some((*dust_window, *dust_threshold)) } else { None },
             out,
             out_format,
             soft.as_deref(),
@@ -1042,6 +1122,8 @@ fn run_mask_indexed(
     min_hits: usize,
     min_density: f64,
     library: Option<&align::Library>,
+    tandem_params: Option<tandem::TandemParams>,
+    dust: Option<(usize, f64)>,
     out: &PathBuf,
     out_format: &OutputFormat,
     soft: Option<&std::path::Path>,
@@ -1084,6 +1166,12 @@ fn run_mask_indexed(
         }
         indices.push(idx);
     }
+    if let Some(tp) = tandem_params {
+        println!(
+            "Tandem detection: k={}, max period {}, min len {}, identity >= {:.2}",
+            tp.k, tp.max_period, tp.min_len, tp.min_identity
+        );
+    }
     if let Some(lib) = library {
         println!(
             "Loaded library: {} consensi, {} bp, {} seeded positions; min score {}, band {}, x-drop {}",
@@ -1117,6 +1205,14 @@ fn run_mask_indexed(
         };
         if let Some(lib) = library {
             regions.extend(lib.mask_record(&rec.header, &rec.seq));
+            align::merge_regions(&mut regions);
+        }
+        if let Some(tp) = tandem_params {
+            regions.extend(tandem::find_tandems(&rec.header, &rec.seq, &tp));
+            align::merge_regions(&mut regions);
+        }
+        if let Some((w, t)) = dust {
+            regions.extend(tandem::find_low_complexity(&rec.header, &rec.seq, w, t));
             align::merge_regions(&mut regions);
         }
         let masked: usize = regions.iter().map(|r| r.end - r.start).sum();

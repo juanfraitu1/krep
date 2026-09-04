@@ -170,6 +170,59 @@ MIR, CR1, Helitron): their consensi are hard to build de novo and their copies
 are short fragments at ~65% identity. Everything younger than ~150 My is
 recovered at 75–99%.
 
+### Hybrid mode: a curated library where de novo cannot reach
+
+`--library` accepts any consensus FASTA, so the families krep cannot build can
+come from Dfam (CC0). Feeding RepeatMasker's own 1,403 human consensi through
+krep's aligner is also the cleanest diagnostic available: it separates
+consensus quality from aligner sensitivity. On chr1:
+
+| library | P | R | F1 | ERVL | Tip100 | Helitron | MIR | L2 |
+|---|---|---|---|---|---|---|---|---|
+| krep de novo (v2) | 0.965 | 0.738 | 0.837 | 0.503 | 0.167 | 0.020 | 0.334 | 0.138 |
+| Dfam human | 0.994 | 0.806 | **0.890** | 0.805 | 0.618 | 0.526 | 0.376 | 0.273 |
+| k18@32 + Dfam + tandem | 0.975 | 0.822 | **0.892** | | | | | |
+
+So for the mid-age families the consensus was the limit and Dfam fixes it;
+for MIR and L2 it was not — RepeatMasker's own consensi barely move them
+through krep's two-hit seed chain. `--lib-single-hit` triggers extension on
+every gated seed hit instead: Dfam-only rises to **P 0.990 / R 0.834 /
+F1 0.905**, with MIR 0.38→0.44, L2 0.27→0.35, CR1 0.21→0.30 and Helitron
+0.53→0.67. It is several times slower than chained mode because ancient
+debris passes the ungapped gate against related consensi and then fails
+the alignment. Adding krep's de novo consensi on top of Dfam buys +1.7
+recall for −2.7 precision (they carry segmental duplications and gene
+families); the k-mer index at threshold 32 adds satellites and simple
+repeats Dfam lacks at almost no precision cost.
+
+```bash
+# Dfam human consensi via the API (JSON-wrapped FASTA; unwrap the "body")
+curl -s "https://dfam.org/api/families?clade=9606&clade_relatives=ancestors&format=fasta&limit=5000"
+krep mask --genome chr1.fa --index chm13.k18.s16.kidx --index-threshold 32 --graph-gap 100 \
+  --library dfam_human.fa --lib-seed 11101001100111 --lib-min-score 30 --tandem --out chr1.bed
+```
+
+Whether to use this is a policy choice: with Dfam, krep is no longer library-free.
+
+### NCBI-style masking (WindowMasker + TRF + DUST)
+
+NCBI's `genomic.fna` lowercase is not RepeatMasker; it is WindowMasker (k-mer
+frequency), TRF (tandem repeats) and DUST (low complexity). krep's k-mer index
+is the WindowMasker analogue; `--tandem` and `--dust` supply the other two:
+
+```bash
+krep mask --genome chr1.fa --index chm13.k18.s16.kidx --index-threshold 6 --graph-gap 100 \
+  --tandem --dust --dust-threshold 3 --min-len 20 --out chr1_ncbi_style.bed --soft chr1_ncbi_style.fa
+krep compare-mask --reference GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --predicted chr1_ncbi_style.fa
+```
+
+Against the NCBI lowercase on chr1 this scores P 0.853 / R 0.732 / F1 0.788
+(the RepeatMasker-oriented configuration scores 0.757 against it). Tandem
+detection is k-mer recurrence at a fixed period verified by periodic
+self-identity; DUST is triplet-frequency skew over a 64-bp window. RepeatMasker's
+Simple_repeat / Low_complexity classes are only half recovered by these
+(0.50 / 0.30) because many are low-complexity with a *wobbling* period.
+
 `--index-threshold` is a **genome-wide** occurrence count. It is on a completely
 different scale from the per-slice `--threshold` and must be retuned, not
 carried over: the same family that occurs 5 times in a 10 Mb slice occurs
@@ -280,6 +333,10 @@ Repeat families in the mock genome: ALU, LINE1, SINE, LTR, MICROSAT, SAT, **SEG_
 | `--lib-min-score` | `50` | Minimum alignment score (match +1, mismatch −1, gap −3) |
 | `--lib-band` | `16` | Alignment band half-width |
 | `--lib-xdrop` | `40` | Stop extending once the score falls this far below its best |
+| `--lib-seed` | PatternHunter w11 | Spaced seed for library hits (weight 8–13, need not be symmetric). Weight 9 (`11101001100111`) is the sensitivity/speed knee on human |
+| `--lib-single-hit` | off | Trigger extension on every gated seed hit instead of two hits on one diagonal; more sensitive to short diverged fragments, slower |
+| `--tandem` | off | Tandem repeats: k-mer (`--tandem-k`, 5) recurrence at a fixed period ≤ `--tandem-max-period` (500), kept if dense (`--tandem-density`, 0.25) and periodic identity ≥ `--tandem-identity` (0.7), length ≥ `--tandem-min-len` (20) |
+| `--dust` | off | Low complexity: DUST triplet-skew score over `--dust-window` (64) bases above `--dust-threshold` (5; random ~0.5, (CA)n ~15, poly-A ~31) |
 
 ### `index`
 
