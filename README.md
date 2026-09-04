@@ -206,6 +206,36 @@ krep mask --genome chr1.fa --index chm13.k18.s16.kidx --index-threshold 32 --gra
   --library dfam_human.fa --lib-seed 11101001100111 --lib-min-score 30 --tandem --out chr1.bed
 ```
 
+**Whole genome, hybrid.** k18 index at threshold 32 + Dfam human consensi
+in single-hit mode (gate −4,2) + tandem + DUST, all 24 chromosomes in
+**41 minutes**, soft-masked FASTA written:
+
+| | library-free (k18@8 + krep v2) | hybrid (k18@32 + Dfam single-hit + tandem + dust) |
+|---|---|---|
+| masked | 44.3% | 47.6% |
+| precision | 0.937 | **0.967** |
+| recall | 0.767 | **0.849** |
+| F1 | 0.844 | **0.904** |
+
+| family | library-free | hybrid |
+|---|---|---|
+| SINE/Alu | 0.993 | 0.995 |
+| Retroposon/SVA | 0.992 | 0.991 |
+| Satellite/centr | 0.998 | 0.997 |
+| LTR/ERVK | 0.962 | 0.996 |
+| LINE/L1 | 0.834 | 0.917 |
+| LTR/ERV1 | 0.793 | 0.944 |
+| LTR/ERVL-MaLR | 0.750 | 0.856 |
+| Simple_repeat | 0.884 | 0.848 |
+| DNA/TcMar-Tigger | 0.738 | 0.870 |
+| LTR/ERVL | 0.491 | 0.819 |
+| DNA/hAT-Charlie | 0.509 | 0.736 |
+| DNA/hAT-Tip100 | 0.199 | 0.660 |
+| RC/Helitron | 0.022 | 0.603 |
+| SINE/MIR | 0.330 | 0.394 |
+| LINE/L2 | 0.146 | 0.310 |
+| LINE/CR1 | 0.022 | 0.253 |
+
 Whether to use this is a policy choice: with Dfam, krep is no longer library-free.
 
 ### NCBI-style masking (WindowMasker + TRF + DUST)

@@ -196,9 +196,16 @@ killed once mid-run; `run_genome.sh` relaunches it detached
   | −12,−2 | 921 s | 0.990 | 0.831 | 0.904 | 0.44 | 0.34 | 0.29 |
 
   Final hybrid on chr1 (k18@32 + Dfam single-hit −4,2 + tandem + dust 5):
-  P 0.971 / R 0.838 / F1 0.899 in 192 s. Genome run: `run_genome2.sh`
-  (outputs `chm13_krep_hybrid.bed`, `chm13_krep_hybrid_soft.fa`,
-  `genome2_eval*.txt`).
+  P 0.971 / R 0.838 / F1 0.899 in 192 s.
+
+  **Whole genome, hybrid: P 0.967 / R 0.849 / F1 0.904**, 41 min, 47.6%
+  masked (library-free run: 0.937 / 0.767 / 0.844). Outputs
+  `C:\krep_work\chm13_krep_hybrid.bed`, `chm13_krep_hybrid_soft.fa`
+  (3.16 GB), `genome2_eval.txt` / `genome2_eval_family.txt`; launcher
+  `run_genome2.sh`. Genome-wide per family (library-free → hybrid):
+  L1 0.834→0.917, ERVL 0.491→0.819, Charlie 0.509→0.736,
+  Helitron 0.022→0.603, MIR 0.330→0.394, L2 0.146→0.310,
+  CR1 0.022→0.253.
 - **`--tandem`** (`src/tandem.rs`): fixed-period k-mer recurrence runs +
   periodic identity. k=5, density 0.25, min len 20 is the swept optimum
   (Simple_repeat 0.435, P 0.90 alone). Most misses are wobbly-period
