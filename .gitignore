@@ -1,0 +1,12 @@
+/target
+target2/
+target3/
+*.fa
+*.bed
+*.gtf
+*.fna
+*.fasta
+chm13_*
+masked_*
+*.exe
+
