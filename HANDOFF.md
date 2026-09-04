@@ -173,7 +173,32 @@ killed once mid-run; `run_genome.sh` relaunches it detached
   the memo a weakly similar region re-triggered a full DP at every position;
   the first attempt ran >50 min on chr1). Dfam-only, chr1: P 0.990 /
   R 0.834 / F1 0.905 (chained: 0.890); MIR 0.44, L2 0.35, CR1 0.30,
-  Helitron 0.67. 1,771 s before the cooldown.
+  Helitron 0.67, but 1,771 s.
+
+  Where that time went, in order of discovery: (1) a global 8-base cooldown
+  after failed DPs made it 5× faster and destroyed the gain (F1 0.852) —
+  the pause blankets a real fragment's few seed hits; reverted. (2) Capping
+  DPs to the two best-gated entries per position kept sensitivity but saved
+  only 16%. (3) The real cause: the gate's right-hand window *included the
+  seed*, whose nine care positions match by construction, pre-loading it
+  by ~+6 so the one-sided rule fired by chance at ~25% of positions. With
+  the seed excluded the run takes 64 s — and sensitivity drops back to
+  chained levels, because the gain was coming from exactly those loosely
+  gated hits: short fragments whose flanks run into random sequence. So the
+  gate is the dial, now explicit as `--lib-gate SUM,SIDE`:
+
+  | gate | chr1 time | P | R | F1 | MIR | L2 | CR1 |
+  |---|---|---|---|---|---|---|---|
+  | 4,6 | 69 s | 0.993 | 0.806 | 0.890 | 0.38 | 0.28 | 0.22 |
+  | 0,4 | 101 s | 0.992 | 0.814 | 0.895 | 0.40 | 0.30 | 0.25 |
+  | −4,2 | 190 s | 0.992 | 0.823 | 0.899 | 0.42 | 0.32 | 0.26 |
+  | −8,0 | 432 s | 0.991 | 0.828 | 0.902 | 0.43 | 0.33 | 0.28 |
+  | −12,−2 | 921 s | 0.990 | 0.831 | 0.904 | 0.44 | 0.34 | 0.29 |
+
+  Final hybrid on chr1 (k18@32 + Dfam single-hit −4,2 + tandem + dust 5):
+  P 0.971 / R 0.838 / F1 0.899 in 192 s. Genome run: `run_genome2.sh`
+  (outputs `chm13_krep_hybrid.bed`, `chm13_krep_hybrid_soft.fa`,
+  `genome2_eval*.txt`).
 - **`--tandem`** (`src/tandem.rs`): fixed-period k-mer recurrence runs +
   periodic identity. k=5, density 0.25, min len 20 is the swept optimum
   (Simple_repeat 0.435, P 0.90 alone). Most misses are wobbly-period

@@ -181,16 +181,20 @@ consensus quality from aligner sensitivity. On chr1:
 |---|---|---|---|---|---|---|---|---|
 | krep de novo (v2) | 0.965 | 0.738 | 0.837 | 0.503 | 0.167 | 0.020 | 0.334 | 0.138 |
 | Dfam human | 0.994 | 0.806 | **0.890** | 0.805 | 0.618 | 0.526 | 0.376 | 0.273 |
-| k18@32 + Dfam + tandem | 0.975 | 0.822 | **0.892** | | | | | |
+| k18@32 + Dfam + tandem | 0.975 | 0.822 | 0.892 | | | | | |
+| Dfam, single-hit gate −4,2 | 0.992 | 0.823 | 0.899 | 0.85 | 0.68 | 0.63 | 0.42 | 0.32 |
+| **k18@32 + Dfam single-hit −4,2 + tandem + dust** | 0.971 | 0.838 | **0.899** | | | | 0.42 | 0.32 |
 
 So for the mid-age families the consensus was the limit and Dfam fixes it;
 for MIR and L2 it was not — RepeatMasker's own consensi barely move them
 through krep's two-hit seed chain. `--lib-single-hit` triggers extension on
 every gated seed hit instead: Dfam-only rises to **P 0.990 / R 0.834 /
 F1 0.905**, with MIR 0.38→0.44, L2 0.27→0.35, CR1 0.21→0.30 and Helitron
-0.53→0.67. It is several times slower than chained mode because ancient
-debris passes the ungapped gate against related consensi and then fails
-the alignment. Adding krep's de novo consensi on top of Dfam buys +1.7
+0.53→0.67. Its cost is set by `--lib-gate`, the ungapped flank test that decides
+whether a seed hit earns a banded alignment: the sensitivity comes from
+short fragments whose flanks run off into random sequence, so a looser gate
+finds more of them and runs more alignments that fail. At `-4,2` it costs
+about 3× chained mode for most of the gain. Adding krep's de novo consensi on top of Dfam buys +1.7
 recall for −2.7 precision (they carry segmental duplications and gene
 families); the k-mer index at threshold 32 adds satellites and simple
 repeats Dfam lacks at almost no precision cost.
@@ -334,7 +338,8 @@ Repeat families in the mock genome: ALU, LINE1, SINE, LTR, MICROSAT, SAT, **SEG_
 | `--lib-band` | `16` | Alignment band half-width |
 | `--lib-xdrop` | `40` | Stop extending once the score falls this far below its best |
 | `--lib-seed` | PatternHunter w11 | Spaced seed for library hits (weight 8–13, need not be symmetric). Weight 9 (`11101001100111`) is the sensitivity/speed knee on human |
-| `--lib-single-hit` | off | Trigger extension on every gated seed hit instead of two hits on one diagonal; more sensitive to short diverged fragments, slower |
+| `--lib-single-hit` | off | Trigger extension on every gated seed hit instead of two hits on one diagonal; more sensitive to short diverged fragments |
+| `--lib-gate` | `4,6` | Single-hit gate "SUM,SIDE" on the ungapped flank score (32 bp each side of the seed, seed excluded; random flanks average −16 per side). This is the sensitivity/speed dial: on chr1 with Dfam, `4,6` 69 s / F1 0.890, `0,4` 101 s / 0.895, `-4,2` 190 s / 0.899, `-8,0` 432 s / 0.902, `-12,-2` 921 s / 0.904. Negative values need the `--lib-gate=-4,2` form |
 | `--tandem` | off | Tandem repeats: k-mer (`--tandem-k`, 5) recurrence at a fixed period ≤ `--tandem-max-period` (500), kept if dense (`--tandem-density`, 0.25) and periodic identity ≥ `--tandem-identity` (0.7), length ≥ `--tandem-min-len` (20) |
 | `--dust` | off | Low complexity: DUST triplet-skew score over `--dust-window` (64) bases above `--dust-threshold` (5; random ~0.5, (CA)n ~15, poly-A ~31) |
 

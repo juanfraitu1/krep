@@ -29,8 +29,9 @@ const CHAIN_WINDOW: usize = 64;
 const CHAIN_DIAG: i64 = 3;
 /// Recent hits remembered per oriented consensus.
 const SLOTS: usize = 2;
-/// Single-hit mode: bases skipped after a failed extension.
-const SINGLE_HIT_COOLDOWN: usize = 8;
+/// Single-hit mode: banded DPs attempted per genome position, taken from the
+/// entries with the best ungapped gate scores.
+const SINGLE_HIT_TOP: usize = 2;
 
 pub struct Library {
     pub names: Vec<String>,
@@ -50,6 +51,11 @@ pub struct Library {
     /// instead of requiring two hits on one diagonal. Far more sensitive to
     /// short diverged fragments; costs ~1 µs per genome position.
     pub single_hit: bool,
+    /// Single-hit gate: pass when the summed flank score reaches `gate_sum`
+    /// or either flank alone reaches `gate_side`. Lower is more sensitive to
+    /// short fragments whose flanks run into random sequence, and slower.
+    pub gate_sum: i32,
+    pub gate_side: i32,
 }
 
 fn revcomp(seq: &[u8]) -> Vec<u8> {
@@ -161,6 +167,8 @@ impl Library {
             band,
             xdrop,
             single_hit: false,
+            gate_sum: 4,
+            gate_side: 6,
         })
     }
 
@@ -214,10 +222,9 @@ impl Library {
         // weight is thousands of comparisons per genome position.
         let mut last: Vec<[(u32, i64, u32); SLOTS]> =
             vec![[(u32::MAX, 0, 0); SLOTS]; self.seqs.len()];
-        // Single-hit mode: last failed (genome pos, diagonal) per consensus,
-        // and a global pause after any failed extension.
+        // Single-hit mode: last failed (genome pos, diagonal) per consensus.
         let mut failed: Vec<(u32, i64)> = vec![(u32::MAX, 0); self.seqs.len()];
-        let mut cooldown_until = 0usize;
+        let mut cands: Vec<(i32, u32, u32)> = Vec::new();
         let mut masked_until = 0usize;
         let (mut fwd, mut valid) = (0u64, 0usize);
 
@@ -248,20 +255,30 @@ impl Library {
             }
 
             if self.single_hit {
-                if g < cooldown_until {
-                    continue;
-                }
+                // Gate every entry cheaply, then spend banded DPs only on the
+                // best-gated few. Inside an old L1 fragment a position can
+                // pass the gate for a dozen related L1 consensi; running a DP
+                // for each is where naive single-hit mode spends its time,
+                // while the true consensus is almost always the top gate score.
+                cands.clear();
                 for &(oi, cpos) in &self.entries[lo..hi] {
                     let diag = g as i64 - cpos as i64;
-                    // A diagonal that just failed to extend will fail again a
-                    // few bases on; without this memo a region weakly similar
-                    // to some consensus triggers a full DP at every position.
                     let (fg, fd) = failed[oi as usize];
                     if fg != u32::MAX && (fg as usize) + CHAIN_WINDOW >= g && (fd - diag).abs() <= CHAIN_DIAG {
                         continue;
                     }
+                    if let Some(gs) = self.gate(seq, oi as usize, cpos as usize, g) {
+                        cands.push((gs, oi, cpos));
+                    }
+                }
+                if cands.len() > SINGLE_HIT_TOP {
+                    cands.select_nth_unstable_by(SINGLE_HIT_TOP - 1, |a, b| b.0.cmp(&a.0));
+                    cands.truncate(SINGLE_HIT_TOP);
+                }
+                cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                for &(_, oi, cpos) in cands.iter() {
                     if let Some((start, end, score)) =
-                        self.extend_hit(seq, oi as usize, cpos as usize, g)
+                        self.extend_gated(seq, oi as usize, cpos as usize, g)
                     {
                         regions.push(MaskedRegion {
                             chrom: chrom.to_string(),
@@ -272,14 +289,7 @@ impl Library {
                         masked_until = end;
                         break;
                     }
-                    failed[oi as usize] = (g as u32, diag);
-                    // Sub-threshold genuine similarity (ancient debris against
-                    // a related consensus) is where single-hit mode spends its
-                    // time: the gate passes, the DP fails, and the next base
-                    // offers another entry on another diagonal. A real
-                    // fragment has several seed hits, so pausing a few bases
-                    // after any failed DP costs little sensitivity.
-                    cooldown_until = g + SINGLE_HIT_COOLDOWN;
+                    failed[oi as usize] = (g as u32, g as i64 - cpos as i64);
                 }
                 continue;
             }
@@ -322,38 +332,53 @@ impl Library {
         regions
     }
 
-    /// Extend from an anchored seed in both directions. Returns the genome
-    /// interval and total score if it clears `min_score`.
+    /// Ungapped look along the anchor diagonal: the cheap test that decides
+    /// whether a banded DP is worth running. A spurious chain is random
+    /// sequence here (expected -0.5/base); a real copy even at 62% identity
+    /// averages +0.25/base. Either side may be broken by an indel, so it
+    /// accepts on the sum or on one side alone. Returns the summed score when
+    /// the gate passes.
+    #[inline]
+    fn gate(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<i32> {
+        let cons = &self.seqs[oi];
+        // Both windows sit *outside* the seed span. The seed's care positions
+        // match by construction, so a window that included them would start
+        // ~+6 in the black and the one-sided rule would fire by chance at a
+        // large fraction of positions — which is exactly what made naive
+        // single-hit mode 10x slower than it should be.
+        let span = self.span;
+        let left = cpos.min(gpos).min(32);
+        let (cr, gr) = (cpos + span, gpos + span);
+        let right = cons.len().saturating_sub(cr).min(seq.len().saturating_sub(gr)).min(32);
+        let (mut sl, mut sr) = (0i32, 0i32);
+        for o in 0..left {
+            sl += if cons[cpos - 1 - o] == seq[gpos - 1 - o] { MATCH } else { MISMATCH };
+        }
+        for o in 0..right {
+            sr += if cons[cr + o] == seq[gr + o] { MATCH } else { MISMATCH };
+        }
+        // Single-hit mode has no second seed hit backing the candidate, so
+        // its gate is stricter.
+        let pass = if self.single_hit {
+            sl + sr >= self.gate_sum || sl >= self.gate_side || sr >= self.gate_side
+        } else {
+            sl + sr >= -8
+        };
+        if pass { Some(sl + sr) } else { None }
+    }
+
+    /// Extend from an anchored seed in both directions (gate first).
     fn extend_hit(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<(usize, usize, i32)> {
+        self.gate(seq, oi, cpos, gpos)?;
+        self.extend_gated(seq, oi, cpos, gpos)
+    }
+
+    /// Banded X-drop extension both ways from an anchor that already passed
+    /// the gate. Returns the genome interval and total score if it clears
+    /// `min_score`.
+    fn extend_gated(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<(usize, usize, i32)> {
         let cons = &self.seqs[oi];
         let band = self.band;
-        // Ungapped look along the anchor diagonal first. A spurious chain is
-        // random sequence here (expected -0.5/base); a real copy even at 62%
-        // identity averages +0.25/base. This costs ~64 comparisons and spares
-        // the banded DP for the large majority of false chains.
-        {
-            let left = cpos.min(gpos).min(32);
-            let right = (cons.len() - cpos).min(seq.len() - gpos).min(32);
-            let (mut sl, mut sr) = (0i32, 0i32);
-            for o in 0..left {
-                sl += if cons[cpos - 1 - o] == seq[gpos - 1 - o] { MATCH } else { MISMATCH };
-            }
-            for o in 0..right {
-                sr += if cons[cpos + o] == seq[gpos + o] { MATCH } else { MISMATCH };
-            }
-            // Either side may be broken by an indel, so accept on the sum or
-            // on one side alone. In single-hit mode this gate is the only
-            // thing standing between every seed hit and a banded DP, so it
-            // is stricter: random sequence averages -16 per side.
-            let pass = if self.single_hit {
-                sl + sr >= 4 || sl >= 6 || sr >= 6
-            } else {
-                sl + sr >= -8
-            };
-            if !pass {
-                return None;
-            }
-        }
         // Forward: consensus tail vs a bounded genome slice.
         let c_fwd = &cons[cpos..];
         let g_end = (gpos + c_fwd.len() + band + 64).min(seq.len());

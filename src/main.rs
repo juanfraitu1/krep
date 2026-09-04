@@ -205,6 +205,14 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         lib_single_hit: bool,
 
+        /// Single-hit gate thresholds "SUM,SIDE" on the ungapped flank score
+        /// (32 bp each side of the seed, match +1 / mismatch -1): pass when
+        /// the sum reaches SUM or either side reaches SIDE. Random flanks
+        /// average -16 per side. Lower values find more short diverged
+        /// fragments and cost time.
+        #[arg(long, value_delimiter = ',', default_value = "4,6")]
+        lib_gate: Vec<i32>,
+
         /// Also detect tandem repeats (Tandem Repeats Finder-style): k-mer
         /// recurrence at a fixed period, verified by periodic self-identity.
         /// Supplies the TRF half of an NCBI-style mask and lifts
@@ -572,6 +580,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         lib_xdrop,
         lib_seed,
         lib_single_hit,
+        lib_gate,
         tandem,
         tandem_max_period,
         tandem_min_len,
@@ -615,6 +624,10 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             Some(p) => {
                 let mut l = align::Library::load_with_seed(p, lib_seed, *lib_min_score, *lib_band, *lib_xdrop)?;
                 l.single_hit = *lib_single_hit;
+                if lib_gate.len() == 2 {
+                    l.gate_sum = lib_gate[0];
+                    l.gate_side = lib_gate[1];
+                }
                 Some(l)
             }
             None => None,
