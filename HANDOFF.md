@@ -17,6 +17,9 @@ A repeat masker for T2T-CHM13 that works in three layers, all in
    per-consensus filter.
 3. **Tandem + DUST** (`--tandem`, `--dust`): the TRF/DUST half of an
    NCBI-style mask.
+4. **Profile-HMM layer** (`--hmm-bed`): merge pre-computed HMM hits (e.g.
+   `nhmmer`) into the masked output. This is what rescues the oldest
+   families (MIR, L2, CR1) that a single consensus cannot align reliably.
 
 ## Final numbers (whole genome, all 24 chromosomes, vs RepeatMasker .out)
 
@@ -91,6 +94,8 @@ krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
 - Mock genomes for regression: `mock15.*`, `mock25.*`.
 - Substitution-count dump: `chr1_subst.tsv` (39.6M gate-window bases from
   415k accepted library hits on chr1; produced by `--lib-subst-dump`).
+- HMM layer: `target_hmms.hmm` (Dfam MIR/L2/CR1 keys), per-family
+  `*_chr1.tbl`/`*_chr1.bed`, merged `hmm_mir_l2_cr1_chr1.bed`.
 - Launch scripts: `run_genome2.sh`, `run_final.sh`, `run_dump.sh`,
   `run_gate.sh`, `run_dump34.sh`, `run_dump10.sh`, `run_train234.sh`,
   `run_train10.sh`, `run_gbm.sh`, `run_gbm10.sh`.
@@ -167,15 +172,36 @@ and selected for the existing flat score. Family-specific matrices
 family) may still help, but that requires much more data and a new
 alignment format. For now this path is deprioritised.
 
+### 5. Profile HMM layer (`--hmm-bed`)
+
+Implemented an optional profile-HMM merge in `krep mask`. The workflow is:
+run `nhmmer` on the target sequence with one or more Dfam HMMs, convert the
+`--tblout` to BED with `scripts/nhmmer_to_bed.py`, merge per-family BEDs with
+`scripts/run_nhmmer_layer.sh`, and pass the merged BED to `krep mask --hmm-bed`.
+The BED regions are folded into every mask layer (index/library/tandem/dust)
+per chromosome and appear in both the output BED and any soft/hard FASTA.
+
+On chr1 vs `chr1_rm_family.bed` (production model + MIR/L2/CR1_Mam HMMs,
+`-E 1e-2`):
+
+| layer | P | R | F1 | SINE/MIR | LINE/L2 | LINE/CR1 |
+|---|---|---|---|---|---|---|
+| production (no HMM) | 0.9578 | 0.8611 | 0.9069 | 0.5202 | 0.4243 | 0.3648 |
+| + MIR HMM | 0.9562 | 0.8772 | 0.9150 | 0.7874 | 0.4253 | 0.3652 |
+| + MIR + L2 + CR1_Mam | **0.9502** | **0.8931** | **0.9208** | **0.7877** | **0.6262** | **0.3789** |
+
+The MIR and L2 gains are large; CR1_Mam alone is weak because it only covers
+one CR1 subfamily (2.9% recall of LINE/CR1 at 0.48 precision). The merged
+layer costs ~0.8 points of precision but buys 3.2 points of recall and lifts
+F1 by 0.014 on chr1. A whole-genome run with the HMM layer is the next
+measurement.
+
 ## Remaining tasks, in priority order
 
-1. **Profile HMMs for MIR / L2 / CR1.** Dfam ships each family as an HMM;
-   nhmmer-style search is what finds ancient fragments a single consensus
-   cannot. Largest engineering item, largest recall headroom
-   (L2 0.42 / MIR 0.52 / CR1 0.36 today). Two viable routes:
-   - Wrap `nhmmer`/`hmmsearch` on Dfam `.hmm` files and merge hits.
-   - Implement a small Viterbi HMM scanner inside krep for the few
-     high-impact families (MIR, L2, CR1).
+1. **Whole-genome HMM-layer run.** The chr1 gain is large; confirm it on
+   all 24 chromosomes against `genome_rm_family.bed`. The main cost is
+   running `nhmmer` once per family on the whole genome; the `krep mask`
+   merge is cheap (~2.6 min on chr1).
 2. **Short diverged fragments in single-hit mode.** A length-normalized score
    threshold or a separate path for short consensi (< 400 bp) could rescue
    some MIR/L2 at a measurable precision cost. The sub-15 score band shows
@@ -524,7 +550,8 @@ Data: `C:\krep_work\dfam_human.fa` (1,403 consensi, headers `name#accession`),
 
 Windows Application Control intermittently blocks freshly built executables
 (os error 4551) — it hit the test harness and Cargo build scripts, while the
-release `krep.exe` kept running. So:
+release `krep.exe` kept running. If a fresh `.exe` is blocked, use the WSL
+native binary (built below) until the policy allows the new file.
 
 - **Tests: WSL.** Rust (rustup, minimal) and `build-essential` are installed
   in WSL. Build on ext4, not `/mnt/c`:
@@ -538,4 +565,15 @@ export PATH="/mnt/c/mingw64/bin:$PATH"
 cp target3/release/krep.exe /mnt/c/krep_work/krep.exe
 ```
 
-Pass Windows-style paths (`C:/...`) to the `.exe`.
+  Pass Windows-style paths (`C:/...`) to the `.exe`.
+
+- **WSL fallback binary** (current, since the latest Windows build is blocked):
+  build a native Linux binary and run it from WSL with `/mnt/c/...` paths:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release --target-dir ~/krep_target
+cp ~/krep_target/release/krep /mnt/c/krep_work/krep_wsl
+```
+
+  The chr1 HMM-layer numbers below were produced with `/mnt/c/krep_work/krep_wsl`.

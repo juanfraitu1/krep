@@ -12,6 +12,7 @@ mod rng;
 mod tandem;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -227,6 +228,14 @@ enum Commands {
         /// scoring matrix.
         #[arg(long, value_name = "TSV")]
         lib_subst_dump: Option<PathBuf>,
+
+        /// Merge an external BED into the masked output. Intended for
+        /// profile-HMM hits (e.g. nhmmer) that krep's seed-and-extend
+        /// aligner cannot find on its own. The BED must share the same
+        /// sequence IDs as the input FASTA; overlaps with other mask layers
+        /// are merged.
+        #[arg(long, value_name = "BED")]
+        hmm_bed: Option<PathBuf>,
 
         /// Learned per-consensus minimum scores (TSV `name<TAB>min_score`);
         /// a hit must clear both this and --lib-min-score.
@@ -604,6 +613,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         lib_dump,
         lib_subst_dump,
         lib_model,
+        hmm_bed,
         tandem,
         tandem_max_period,
         tandem_min_len,
@@ -678,6 +688,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             if *dust { Some((*dust_window, *dust_threshold)) } else { None },
             lib_dump.as_deref(),
             lib_subst_dump.as_deref(),
+            hmm_bed.as_deref(),
             out,
             out_format,
             soft.as_deref(),
@@ -1168,6 +1179,7 @@ fn run_mask_indexed(
     dust: Option<(usize, f64)>,
     lib_dump: Option<&std::path::Path>,
     lib_subst_dump: Option<&std::path::Path>,
+    hmm_bed: Option<&std::path::Path>,
     out: &PathBuf,
     out_format: &OutputFormat,
     soft: Option<&std::path::Path>,
@@ -1246,6 +1258,22 @@ fn run_mask_indexed(
         }
         None => None,
     };
+    let mut hmm_by_chrom: HashMap<String, Vec<mask::MaskedRegion>> = HashMap::new();
+    let mut hmm_total_bp = 0usize;
+    if let Some(bed_path) = hmm_bed {
+        let hmm_regions = load_bed_regions(bed_path)?;
+        for r in hmm_regions {
+            hmm_total_bp += r.end - r.start;
+            hmm_by_chrom.entry(r.chrom.clone()).or_default().push(r);
+        }
+        println!(
+            "Loaded {} HMM regions ({} bp) from {}",
+            hmm_by_chrom.values().map(|v| v.len()).sum::<usize>(),
+            hmm_total_bp,
+            bed_path.display()
+        );
+    }
+
     let mut stream = fasta::FastaStream::open(genome)?;
     let mut soft_writer = match soft {
         Some(p) => Some(fasta::FastaWriter::create(p)?),
@@ -1257,6 +1285,7 @@ fn run_mask_indexed(
     let mut total_masked = 0u64;
 
     while let Some(mut rec) = stream.next_record(true)? {
+        let id = fasta::seq_id(&rec.header);
         let mut regions = if indices.is_empty() {
             Vec::new()
         } else {
@@ -1309,10 +1338,15 @@ fn run_mask_indexed(
             regions.extend(tandem::find_low_complexity(&rec.header, &rec.seq, w, t));
             align::merge_regions(&mut regions);
         }
+        let id_ref: &str = &id;
+        if let Some(mut hmm_regions) = hmm_by_chrom.remove(id_ref) {
+            regions.extend(hmm_regions.drain(..));
+            align::merge_regions(&mut regions);
+        }
         let masked: usize = regions.iter().map(|r| r.end - r.start).sum();
         println!(
             "  {:<18} {:>12} bp  {:>8} regions  {:>6.2}% masked",
-            fasta::seq_id(&rec.header),
+            id,
             rec.seq.len(),
             regions.len(),
             100.0 * masked as f64 / rec.seq.len().max(1) as f64
@@ -1350,6 +1384,34 @@ fn run_mask_indexed(
         t0.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+fn load_bed_regions(path: &std::path::Path) -> Result<Vec<mask::MaskedRegion>, Box<dyn std::error::Error>> {
+    use std::io::BufRead as _;
+    let file = fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut regions = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let chrom = cols[0].to_string();
+        let start: usize = cols[1].parse()?;
+        let end: usize = cols[2].parse()?;
+        let name = cols.get(3).unwrap_or(&"").to_string();
+        regions.push(mask::MaskedRegion {
+            chrom,
+            start,
+            end,
+            name,
+        });
+    }
+    Ok(regions)
 }
 
 fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
