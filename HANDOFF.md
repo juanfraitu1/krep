@@ -89,6 +89,8 @@ krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
 - Per-chromosome FASTAs: `chm13_chr1_unmasked.fa`, `chm13_chr2_unmasked.fa`,
   `chm13_chr3_unmasked.fa`, `chm13_chr4_unmasked.fa`.
 - Mock genomes for regression: `mock15.*`, `mock25.*`.
+- Substitution-count dump: `chr1_subst.tsv` (39.6M gate-window bases from
+  415k accepted library hits on chr1; produced by `--lib-subst-dump`).
 - Launch scripts: `run_genome2.sh`, `run_final.sh`, `run_dump.sh`,
   `run_gate.sh`, `run_dump34.sh`, `run_dump10.sh`, `run_train234.sh`,
   `run_train10.sh`, `run_gbm.sh`, `run_gbm10.sh`.
@@ -145,31 +147,54 @@ features cannot exploit it without measurable precision loss. The aligner
 itself (gate, seed weight, scoring matrix) has to get better before a
 post-hoc filter can turn that signal into recall gain.
 
+### 4. Divergence-aware scoring (started)
+
+Added `--lib-subst-dump` to collect A/C/G/T counts from the gate windows
+of accepted library hits. Running it on chr1 with the production
+logistic model produced 39.6M counted bases from 415k hits:
+
+- matches: 24.54M (62.0%)
+- transitions: 6.49M (16.4%)
+- transversions: 8.54M (21.6%)
+- Ti/Tv ratio = **0.76**
+
+A generic transition-biased matrix (transition score −0.78, transversion
+−1.17, keeping E_random = −0.5) is **not obviously better** than the
+flat mismatch = −1. The accepted-hit spectrum is not transition-rich
+enough for a simple Ti/Tv bias to matter, and the gate windows are short
+and selected for the existing flat score. Family-specific matrices
+(per clade, estimated from high-confidence alignments of each repeat
+family) may still help, but that requires much more data and a new
+alignment format. For now this path is deprioritised.
+
 ## Remaining tasks, in priority order
 
-1. **Divergence-aware scoring.** Alignment scoring is match +1 / mismatch −1
-   / gap −3 everywhere. Estimate a transition/transversion matrix from
-   krep's confident alignments and let the aligner use it; RepeatMasker's
-   gains on ancient families come partly from divergence-specific matrices.
-   Should also make the sub-15 score band usable.
-2. **Profile HMMs for MIR / L2 / CR1.** Dfam ships each family as an HMM;
+1. **Profile HMMs for MIR / L2 / CR1.** Dfam ships each family as an HMM;
    nhmmer-style search is what finds ancient fragments a single consensus
    cannot. Largest engineering item, largest recall headroom
-   (L2 0.42 / MIR 0.52 / CR1 0.36 today).
-3. **Short diverged fragments in single-hit mode.** A length-normalized score
+   (L2 0.42 / MIR 0.52 / CR1 0.36 today). Two viable routes:
+   - Wrap `nhmmer`/`hmmsearch` on Dfam `.hmm` files and merge hits.
+   - Implement a small Viterbi HMM scanner inside krep for the few
+     high-impact families (MIR, L2, CR1).
+2. **Short diverged fragments in single-hit mode.** A length-normalized score
    threshold or a separate path for short consensi (< 400 bp) could rescue
-   some MIR/L2 at a measurable precision cost.
-4. **Precision side.** ~3% FP genome-wide: segmental duplications and gene
+   some MIR/L2 at a measurable precision cost. The sub-15 score band shows
+   ~6 points of recall ceiling if the filter can be made precise.
+3. **Precision side.** ~3% FP genome-wide: segmental duplications and gene
    families masked by the k-mer index (real repeats RepeatMasker does not
    annotate), boundary overhang, and library hits below RepeatMasker's own
    cutoffs. Per-region copy-number stats in the BED would let SD-like
    regions be labelled rather than counted as errors.
+4. **Consensus builder tail**: CR1/Helitron/Tip100 had no usable de novo
+   consensi (seeds below count 30 or too diverged). Lower `--min-seed-count`
+   with a longer run, or seed from the spaced index.
 5. **NCBI-style mode** (index@6 + tandem + dust 3) scores F1 0.788 against
    the NCBI lowercase; matching it closely needs WindowMasker's actual
    two-threshold window scoring. Only worth doing if that mask is a target.
-6. **Consensus builder tail**: CR1/Helitron/Tip100 had no usable de novo
-   consensi (seeds below count 30 or too diverged). Lower `--min-seed-count`
-   with a longer run, or seed from the spaced index.
+6. **Divergence-aware scoring (revisit later).** Needs family-specific
+   transition/transversion matrices estimated from full alignments, not
+   the gate-window counts. Generic Ti/Tv bias is not supported by the
+   observed accepted-hit spectrum.
 
 ## Things that will bite the next person
 
