@@ -188,13 +188,16 @@ On chr1 vs `chr1_rm_family.bed` (production model + MIR/L2/CR1_Mam HMMs,
 |---|---|---|---|---|---|---|
 | production (no HMM) | 0.9578 | 0.8611 | 0.9069 | 0.5202 | 0.4243 | 0.3648 |
 | + MIR HMM | 0.9562 | 0.8772 | 0.9150 | 0.7874 | 0.4253 | 0.3652 |
-| + MIR + L2 + CR1_Mam | **0.9502** | **0.8931** | **0.9208** | **0.7877** | **0.6262** | **0.3789** |
+| + MIR + L2 + CR1_Mam | 0.9502 | 0.8931 | 0.9208 | 0.7877 | 0.6262 | 0.3789 |
+| + MIR + L2 + all CR1 subfams | **0.9501** | **0.8933** | **0.9208** | 0.7877 | 0.6262 | **0.4054** |
 
 The MIR and L2 gains are large; CR1_Mam alone is weak because it only covers
-one CR1 subfamily (2.9% recall of LINE/CR1 at 0.48 precision). The merged
-layer costs ~0.8 points of precision but buys 3.2 points of recall and lifts
-F1 by 0.014 on chr1. A whole-genome run with the HMM layer is the next
-measurement.
+one CR1 subfamily (2.9% recall of LINE/CR1 at 0.48 precision). Adding the
+other nine Dfam CR1 keys (`CR1-16_AMi`, `CR1-13_AMi`, `CR1-12_AMi`,
+`CR1-3_Croc`, `CR1-L3A_Croc`, `CR1-L3B_Croc`, `CR1-11_Crp`, `CR1-1_Amn`,
+`CR1_Amni-1`) lifts LINE/CR1 recall from 0.3789 to 0.4054 at essentially no
+F1 cost. The merged layer costs ~0.8 points of precision but buys 3.2 points
+of recall and lifts F1 by 0.014 on chr1.
 
 ## Remaining tasks, in priority order
 
