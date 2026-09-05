@@ -657,8 +657,22 @@ With `--second-pass-min-len 80 --second-pass-min-support 5
 1,375 consensi** (pass 1 built 1,337, pass 2 added 38). Genome-wide masking
 coverage on chr1–4 with the new library is ~60% vs ~52–55% for the single-pass
 1M library, so the expansion hits substantially more repeat sequence.
-Evaluation of the resulting logistic and rare-family filters on chr1 is
-in progress (see `C:\krep_work\train_eval_pass2c.sh` / `.log`).
+
+Chr1 vs `chr1_rm_family.bed`:
+
+| filter | P | R | F1 | Tip100 | CR1 | L2 | MIR |
+|---|---|---|---|---|---|---|---|
+| single-pass 1M main | 0.9626 | 0.7163 | 0.8214 | 0.0956 | 0.0102 | 0.1301 | 0.3920 |
+| single-pass 1M + rare | 0.9561 | 0.7186 | 0.8205 | 0.0998 | 0.0143 | 0.1409 | 0.3993 |
+| **two-pass 1M main** | **0.9583** | **0.7350** | **0.8319** | 0.1230 | 0.0161 | 0.1920 | 0.4090 |
+| two-pass 1M + rare | 0.9509 | 0.7379 | 0.8310 | 0.1292 | 0.0205 | 0.2075 | 0.4191 |
+
+The two-pass library buys **+1.9 recall** and **+1.0 F1** at the cost of
+**−0.4 precision**, with clear gains for L2/MIR/Tip100. The rare-family
+specialist adds another ~0.3 recall but costs ~0.7 precision. CR1 and
+Helitron remain low even after the second pass because the consensus builder
+still finds almost no CR1/Helitron seeds that clear the minimum requirements
+in either pass.
 
 ## What would still move it
 
