@@ -369,8 +369,9 @@ enum Commands {
         #[arg(short, long)]
         genome: PathBuf,
 
-        /// Contiguous k-mer index from `krep index` (no --seed), used to pick
-        /// abundant seeds.
+        /// k-mer index from `krep index` (contiguous or spaced), used to pick
+        /// abundant seeds. Spaced seeds are more sensitive to ancient/diverged
+        /// repeats; contiguous seeds are faster.
         #[arg(long)]
         index: PathBuf,
 
@@ -386,6 +387,12 @@ enum Commands {
         /// Stop after this many consensi.
         #[arg(long, default_value_t = 2000)]
         max_families: usize,
+
+        /// Maximum number of abundant seeds to collect occurrences for. Larger
+        /// values explore more candidates but use more memory; zero means
+        /// `max_families * 20`.
+        #[arg(long, default_value_t = 0)]
+        seed_pool: usize,
 
         /// Occurrences sampled per seed to build its consensus.
         #[arg(long, default_value_t = 100)]
@@ -1422,6 +1429,7 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         seq_dump,
         min_seed_count,
         max_families,
+        seed_pool,
         max_occ,
         flank,
         band,
@@ -1437,8 +1445,11 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let idx = index::KmerIndex::load(index_path)?;
     println!(
-        "Loaded index: k={}, {} entries. Building consensi (min seed count {}, max {} families) ...",
+        "Loaded index: span={}, weight={}, sample={}, stored min-count={}, {} entries. Building consensi (min seed count {}, max {} families) ...",
         idx.span(),
+        idx.seed.weight(),
+        idx.sample,
+        idx.min_count,
         idx.len(),
         min_seed_count,
         max_families
@@ -1446,6 +1457,7 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     let params = consensus::Params {
         min_seed_count: *min_seed_count,
         max_families: *max_families,
+        seed_pool: *seed_pool,
         max_occ: *max_occ,
         flank: *flank,
         band: *band,

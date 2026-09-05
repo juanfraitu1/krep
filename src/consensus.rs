@@ -24,10 +24,11 @@
 
 use crate::fasta::{self, FastaStream};
 use crate::index::KmerIndex;
-use crate::kmer::encode_base;
+use crate::kmer::{encode_base, SpacedSeed};
 use crate::rng::Rng;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cmp::Reverse;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,11 @@ use std::path::{Path, PathBuf};
 pub struct Params {
     pub min_seed_count: u32,
     pub max_families: usize,
+    /// Cap the number of seeds we collect occurrences for. Keeping every seed
+    /// above `--min-seed-count` in memory can be huge on a dense spaced-seed
+    /// index; limiting to the top `seed_pool` abundant seeds bounds the
+    /// occurrence table. Zero means auto (`max_families * 20`).
+    pub seed_pool: usize,
     pub max_occ: usize,
     pub flank: usize,
     pub band: usize,
@@ -133,11 +139,12 @@ struct Reservoir {
 
 /// Stream the genome once: write the sequence dump (unless it exists) and
 /// collect up to `max_occ` occurrences per seed by reservoir sampling.
+/// `seed` is the spaced (or contiguous) seed used by the index.
 pub fn collect_occurrences(
     genome: &Path,
     dump: &Path,
     seeds: &HashSet<u64>,
-    k: usize,
+    seed: &SpacedSeed,
     max_occ: usize,
     verbose: bool,
 ) -> io::Result<HashMap<u64, Vec<Occ>>> {
@@ -153,8 +160,9 @@ pub fn collect_occurrences(
     let mut offset = 0u64;
     let mut table: HashMap<u64, Reservoir> = HashMap::new();
     let mut rng = Rng::new(0xC0FFEE);
-    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
-    let top = 2 * (k as u32 - 1);
+    let span = seed.span();
+    let mask = if span == 32 { u64::MAX } else { (1u64 << (2 * span)) - 1 };
+    let top = 2 * (span as u32 - 1);
 
     let mut stream = FastaStream::open(genome)?;
     let mut rec_idx = 0u32;
@@ -165,7 +173,7 @@ pub fn collect_occurrences(
             offset += rec.seq.len() as u64;
         }
         let seq = &rec.seq;
-        let n_starts = seq.len().saturating_sub(k - 1);
+        let n_starts = seq.len().saturating_sub(span - 1);
         let block = n_starts.div_ceil(rayon::current_num_threads().max(1)).max(1 << 20);
         let mut bounds = Vec::new();
         let mut b = 0;
@@ -176,12 +184,16 @@ pub fn collect_occurrences(
         let found: Vec<Vec<(u64, Occ)>> = bounds
             .into_par_iter()
             .map(|(bs, be)| {
-                let hi = (be + k - 1).min(seq.len());
+                let hi = (be + span - 1).min(seq.len());
                 let s = &seq[bs..hi];
                 let mut out = Vec::new();
                 // Cap pushes per seed per block: a satellite array would
                 // otherwise emit one hit per base for tens of megabases.
+                // The global reservoir downsamples to max_occ later, so a
+                // modest per-block cap is enough and keeps memory bounded on
+                // dense spaced-seed indices.
                 let mut per_seed: HashMap<u64, usize> = HashMap::new();
+                let per_block_cap = max_occ.min(20);
                 let (mut fwd, mut rev, mut valid) = (0u64, 0u64, 0usize);
                 for (i, &base) in s.iter().enumerate() {
                     match encode_base(base) {
@@ -189,11 +201,13 @@ pub fn collect_occurrences(
                             fwd = ((fwd << 2) | bits) & mask;
                             rev = (rev >> 2) | ((3 - bits) << top);
                             valid += 1;
-                            if valid >= k {
-                                let canon = fwd.min(rev);
+                            if valid >= span {
+                                let fwd_seed = seed.extract(fwd);
+                                let rev_seed = seed.extract(rev);
+                                let canon = fwd_seed.min(rev_seed);
                                 if seeds.contains(&canon) {
                                     let n = per_seed.entry(canon).or_insert(0);
-                                    if *n >= max_occ {
+                                    if *n >= per_block_cap {
                                         continue;
                                     }
                                     *n += 1;
@@ -201,8 +215,8 @@ pub fn collect_occurrences(
                                         canon,
                                         Occ {
                                             rec: rec_idx,
-                                            pos: (bs + i + 1 - k) as u32,
-                                            forward: fwd <= rev,
+                                            pos: (bs + i + 1 - span) as u32,
+                                            forward: fwd_seed <= rev_seed,
                                         },
                                     ));
                                 }
@@ -438,6 +452,10 @@ fn kmer_set(seq: &[u8], k: usize) -> HashSet<u64> {
     crate::kmer::KmerIter::new(seq, k).map(|(_, x)| x).collect()
 }
 
+fn spaced_seed_set(seq: &[u8], seed: &SpacedSeed) -> HashSet<u64> {
+    crate::kmer::SeedIter::new(seq, seed).map(|(_, x)| x).collect()
+}
+
 pub struct Consensus {
     pub id: usize,
     pub seq: Vec<u8>,
@@ -453,27 +471,51 @@ pub fn build_library(
     dump_path: &Path,
     p: &Params,
 ) -> io::Result<Vec<Consensus>> {
-    let k = index.span();
-    if index.seed.weight() != k {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "consensus seeding needs a contiguous k-mer index (built without --seed)",
-        ));
+    let seed = &index.seed;
+    let span = seed.span();
+    let weight = seed.weight();
+    let seed_pool = if p.seed_pool > 0 {
+        p.seed_pool
+    } else {
+        p.max_families.saturating_mul(20).max(100)
+    };
+
+    // Use a bounded min-heap to keep only the top `seed_pool` abundant seeds.
+    // For a dense spaced-seed index this avoids materialising and sorting the
+    // entire candidate list, which can be tens of millions of entries.
+    let mut heap: BinaryHeap<Reverse<(u32, u64)>> = BinaryHeap::new();
+    let mut total_candidates = 0u64;
+    for (s, c) in index.entries() {
+        if c < p.min_seed_count {
+            continue;
+        }
+        total_candidates += 1;
+        if heap.len() < seed_pool {
+            heap.push(Reverse((c, s)));
+        } else if c > heap.peek().unwrap().0 .0 {
+            *heap.peek_mut().unwrap() = Reverse((c, s));
+        }
     }
-    let mut seeds: Vec<(u64, u32)> = index
-        .entries()
-        .filter(|&(_, c)| c >= p.min_seed_count)
+    let mut seeds: Vec<(u64, u32)> = heap
+        .into_iter()
+        .map(|Reverse((c, s))| (s, c))
         .collect();
     seeds.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     if p.verbose {
-        eprintln!("{} candidate seeds with count >= {}", seeds.len(), p.min_seed_count);
+        eprintln!(
+            "{} candidate seeds with count >= {}, using top {} for occurrence collection",
+            total_candidates,
+            p.min_seed_count,
+            seed_pool
+        );
     }
     let seed_set: HashSet<u64> = seeds.iter().map(|&(s, _)| s).collect();
-    let occs = collect_occurrences(genome, dump_path, &seed_set, k, p.max_occ, p.verbose)?;
+    let occs = collect_occurrences(genome, dump_path, &seed_set, seed, p.max_occ, p.verbose)?;
     let mut dump = SeqDump::open(dump_path)?;
 
     let mut library: Vec<Consensus> = Vec::new();
-    let mut covered: HashSet<u64> = HashSet::new(); // canonical k-mers of built consensi
+    // canonical spaced seeds of built consensi
+    let mut covered: HashSet<u64> = HashSet::new();
     let mut covered12: HashSet<u64> = HashSet::new(); // 12-mers, for redundancy
     let mut built = 0usize;
     let mut skipped_covered = 0usize;
@@ -488,10 +530,11 @@ pub fn build_library(
         // A subfamily seed differs from the consensus it belongs to by a
         // mismatch or two, so an exact check lets it through and the family is
         // rebuilt only to be thrown out as redundant. Testing the Hamming-2
-        // neighbourhood (~1,400 k-mers) catches those before the expensive
-        // extension.
+        // neighbourhood (~1,400 k-mers for k=18) catches those before the
+        // expensive extension. For spaced seeds this is an approximation but
+        // still cheap.
         if covered.contains(&seed)
-            || crate::kmer::neighbors(seed, k, 2, true)
+            || crate::kmer::neighbors(seed, weight, 2, true)
                 .iter()
                 .any(|n| covered.contains(n))
         {
@@ -513,34 +556,41 @@ pub fn build_library(
             );
         }
 
-        // Fetch oriented windows: left part (reversed, for leftward growth)
-        // and right part (after the seed).
+        // Fetch oriented windows around the seed span. We keep the actual
+        // seed-span bases from the first occurrence to insert into the
+        // consensus; the extension then grows outward on both sides.
         let mut lefts = Vec::with_capacity(list.len());
         let mut rights = Vec::with_capacity(list.len());
+        let mut seed_span: Option<Vec<u8>> = None;
         for o in list {
             let rec = o.rec as usize;
             let pos = o.pos as usize;
             let start = pos.saturating_sub(p.flank);
-            let end = (pos + k + p.flank).min(dump.record_len(rec));
+            let end = (pos + span + p.flank).min(dump.record_len(rec));
             let win = dump.fetch(rec, start, end)?;
             let seed_off = pos - start;
             let (win, seed_off) = if o.forward {
                 (win, seed_off)
             } else {
                 let n = win.len();
-                (revcomp_bytes(&win), n - seed_off - k)
+                (revcomp_bytes(&win), n - seed_off - span)
             };
+            if seed_span.is_none() {
+                seed_span = Some(win[seed_off..seed_off + span].to_vec());
+            }
             let mut left = win[..seed_off].to_vec();
             left.reverse();
             lefts.push(left);
-            rights.push(win[seed_off + k..].to_vec());
+            rights.push(win[seed_off + span..].to_vec());
         }
 
         let (right_ext, right_scores) = extend(rights, p.band, p.lookahead, p.flank);
         let (left_ext, left_scores) = extend(lefts, p.band, p.lookahead, p.flank);
 
         let mut seq: Vec<u8> = left_ext.iter().rev().copied().collect();
-        seq.extend(crate::kmer::to_string(seed, k).bytes());
+        if let Some(s) = seed_span {
+            seq.extend_from_slice(&s);
+        }
         seq.extend_from_slice(&right_ext);
         let seq = trim_runs(seq);
         let len = seq.len();
@@ -549,13 +599,13 @@ pub fn build_library(
         let support = right_scores
             .iter()
             .zip(&left_scores)
-            .filter(|(r, l)| (**r + **l + k as i32) as f64 >= 0.25 * len as f64)
+            .filter(|(r, l)| (**r + **l + span as i32) as f64 >= 0.25 * len as f64)
             .count();
 
-        // Always mark this seed and the consensus k-mers as covered so the
-        // same family is not rebuilt from another of its seeds.
+        // Always mark this seed and the consensus spaced seeds as covered so
+        // the same family is not rebuilt from another of its seeds.
         covered.insert(seed);
-        let ks = kmer_set(&seq, k);
+        let ks = spaced_seed_set(&seq, &index.seed);
         covered.extend(ks.iter().copied());
 
         let k12 = kmer_set(&seq, 12);
@@ -568,11 +618,12 @@ pub fn build_library(
             rejected += 1;
             if p.verbose {
                 eprintln!(
-                    "  reject: seed count {:>6}  occ {:>3}  len {:>5} (L{}+R{})  support {:>3}  tandem {}  redundant {}",
+                    "  reject: seed count {:>6}  occ {:>3}  len {:>5} (L{}+S{}+R{})  support {:>3}  tandem {}  redundant {}",
                     count,
                     list.len(),
                     len,
                     left_ext.len(),
+                    span,
                     right_ext.len(),
                     support,
                     tandem,

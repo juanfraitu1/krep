@@ -74,8 +74,9 @@ krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
   spaced w16 — not used in the final config).
 - Libraries: `dfam_human.fa` (1,403 Dfam human consensi, `name#accession`,
   fetched via `https://dfam.org/api/families?clade=9606&clade_relatives=ancestors&format=fasta&limit=5000`,
-  JSON-wrapped: unwrap `body`), `chm13_consensi_v2.fa` (1,124 de novo),
-  `krep_plus_dfam.fa` (both).
+  JSON-wrapped: unwrap `body`), `chm13_consensi_v2.fa` (1,124 de novo from the
+  contiguous k18 index), `chm13_consensi_sp16_pool500k.fa` (537 de novo from
+  the spaced w16/s22 index), `krep_plus_dfam.fa` (both).
 - Learned models: `model_logit.tsv` (logistic, chr2-only, production),
   `model_logit_234.tsv` (chr2+3+4, floor 15), `model_logit10.tsv`
   (chr2+3+4, floor 10), `model_chr2.tsv` (per-consensus floors, chr2),
@@ -89,6 +90,8 @@ krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
   T2T segdup/censat for chr1 in `~/krep_data/chr1_sedefSegDups.json`,
   `chr1_censat.json` (UCSC hs1 API).
 - Sequence dump for `krep consensus`: `chm13.kseq` (3.1 GB, reused).
+- Models: `model_sp16_thresholds.tsv`, `model_sp16_logit.tsv` (de novo
+  library filter, trained on chr2+3+4).
 - Per-chromosome FASTAs: `chm13_chr1_unmasked.fa`, `chm13_chr2_unmasked.fa`,
   `chm13_chr3_unmasked.fa`, `chm13_chr4_unmasked.fa`.
 - Mock genomes for regression: `mock15.*`, `mock25.*`.
@@ -213,6 +216,48 @@ is currently blocked by Application Control):
   --hmm-bed /mnt/c/krep_work/hmm_mir_l2_cr1_chr1.bed \
   --out /tmp/chr1_final_logit_hmm.bed
 ```
+
+### 6. De novo spaced-seed consensus (no Dfam/HMM)
+
+The consensus builder now seeds from the dense whole-genome spaced-seed index
+(`chm13.sp16.s1.kidx`). A new `--seed-pool` flag limits how many abundant
+seeds are held for occurrence collection, and the top-K selection uses a
+bounded heap so exploring millions of low-count seeds no longer materialises
+the full candidate list.
+
+```bash
+~/krep_target/release/krep consensus \
+  --genome /mnt/c/Users/jfris/OneDrive/Desktop/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --index /mnt/c/krep_work/chm13.sp16.s1.kidx \
+  --seq-dump /mnt/c/krep_work/chm13.kseq \
+  --out /mnt/c/krep_work/chm13_consensi_sp16_pool500k.fa \
+  --min-seed-count 8 --max-families 2000 --seed-pool 500000 --max-occ 30
+```
+
+This built **537 de novo consensi** in ~4 min at ~1.6 GB peak RAM. The
+library is dominated by Alu/L1/satellite, but also contains real MIR and L2
+fragments (e.g. `krep_fam_00039` = Dfam MIR, `krep_fam_00085/00091` = L2a/MIRb
+3' ends). A logistic hit filter was trained on chr2+3+4 candidates and
+applied to chr1.
+
+Chr1 vs `chr1_rm_family.bed` (k18@32 + de novo library + tandem/dust):
+
+| filter | P | R | F1 | SINE/MIR | LINE/L2 | LINE/CR1 |
+|---|---|---|---|---|---|---|
+| none (score ≥15) | 0.8065 | 0.7794 | 0.7927 | 0.4881 | 0.2853 | 0.1716 |
+| per-consensus thresholds | **0.9422** | 0.7313 | **0.8234** | 0.4283 | 0.1594 | 0.0188 |
+| logistic τ=0.60 | 0.9360 | 0.7325 | 0.8218 | 0.4303 | 0.1624 | 0.0216 |
+| logistic τ=0.50 | 0.9044 | 0.7443 | 0.8166 | 0.4398 | 0.1913 | 0.0496 |
+| logistic τ=0.45 | 0.8824 | 0.7521 | 0.8121 | 0.4481 | 0.2122 | 0.0733 |
+| logistic τ=0.40 | 0.8594 | 0.7602 | 0.8068 | 0.4589 | 0.2337 | 0.1007 |
+| logistic τ=0.35 | 0.8395 | 0.7675 | 0.8019 | 0.4689 | 0.2537 | 0.1279 |
+| logistic τ=0.30 | 0.8249 | **0.7729** | 0.7981 | **0.4772** | **0.2683** | **0.1482** |
+
+The fully de novo pipeline reaches **F1 0.8234 on chr1** at high precision,
+or trades ~12 points of precision for more ancient-family recall (τ=0.3). It
+still trails the Dfam hybrid (F1 ~0.91) and the HMM layer on MIR/L2/CR1, but
+it proves the spaced-seed consensus path works without external repeat
+libraries.
 
 ## Remaining tasks, in priority order
 
@@ -559,8 +604,9 @@ Data: `C:\krep_work\dfam_human.fa` (1,403 consensi, headers `name#accession`),
 - Genome indices: `C:\krep_work\chm13.k18.s16.kidx` (contiguous 18-mer,
   1/16 sampled, 235 MB) and `C:\krep_work\chm13.sp16.s1.kidx` (spaced
   w16/s22, dense, 560 MB)
-- Consensus libraries: `C:\krep_work\chm13_consensi_v2.fa` (1,124 consensi;
-  use this), `chm13_consensi.fa` (v1, 380). Sequence dump
+- Consensus libraries: `C:\krep_work\chm13_consensi_v2.fa` (1,124 consensi
+  from the contiguous k18 index), `chm13_consensi_sp16_pool500k.fa` (537
+  consensi from the spaced w16/s22 index, fully de novo). Sequence dump
   `C:\krep_work\chm13.kseq` (3.1 GB, reused by `krep consensus`).
 - Mock genomes for regression: `C:\krep_work\mock15.*`, `mock25.*`.
 - RepeatMasker BED: `C:\krep_work\chr1_rm.bed` (merged),
