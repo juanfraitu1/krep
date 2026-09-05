@@ -48,6 +48,16 @@ pub struct Params {
     pub min_len: usize,
     pub min_support: usize,
     pub verbose: bool,
+    /// Run a second pass over the same occurrence table with relaxed filters
+    /// to recover low-copy or highly diverged families (e.g. CR1, Helitron)
+    /// that were rejected in the first pass.
+    pub second_pass: bool,
+    /// Second-pass minimum consensus length.
+    pub second_pass_min_len: usize,
+    /// Second-pass minimum support (copies fitting the consensus).
+    pub second_pass_min_support: usize,
+    /// Maximum additional consensi to build in the second pass.
+    pub second_pass_max_families: usize,
 }
 
 const NEG_INF: i32 = i32::MIN / 4;
@@ -523,6 +533,12 @@ pub fn build_library(
     let mut candidates = 0usize;
     let max_candidates = p.max_families.saturating_mul(20).max(100);
 
+    // -----------------------------------------------------------------------
+    // First pass: build high-confidence consensi with the primary filters.
+    // -----------------------------------------------------------------------
+    let mut pass = 1;
+    let mut pass_built = 0usize;
+    let mut pass_candidates = 0usize;
     for &(seed, count) in &seeds {
         if library.len() >= p.max_families || candidates >= max_candidates {
             break;
@@ -546,11 +562,13 @@ pub fn build_library(
             _ => continue,
         };
         candidates += 1;
-        if p.verbose && candidates % 100 == 0 {
+        pass_candidates += 1;
+        if p.verbose && pass_candidates % 100 == 0 {
             eprintln!(
-                "  progress: {} candidates, {} built, {} rejected, {} seeds skipped",
-                candidates,
-                built,
+                "  progress pass{}: {} candidates, {} built, {} rejected, {} seeds skipped",
+                pass,
+                pass_candidates,
+                pass_built,
                 rejected,
                 skipped_covered
             );
@@ -602,23 +620,19 @@ pub fn build_library(
             .filter(|(r, l)| (**r + **l + span as i32) as f64 >= 0.25 * len as f64)
             .count();
 
-        // Always mark this seed and the consensus spaced seeds as covered so
-        // the same family is not rebuilt from another of its seeds.
-        covered.insert(seed);
-        let ks = spaced_seed_set(&seq, &index.seed);
-        covered.extend(ks.iter().copied());
-
         let k12 = kmer_set(&seq, 12);
         let shared = k12.iter().filter(|x| covered12.contains(x)).count();
         let redundant = !k12.is_empty() && shared * 10 >= k12.len() * 6;
-        covered12.extend(k12.iter().copied());
 
         let tandem = is_tandem(&seq);
-        if len < p.min_len || support < p.min_support || tandem || redundant {
+        let pass_min_len = if pass == 1 { p.min_len } else { p.second_pass_min_len };
+        let pass_min_support = if pass == 1 { p.min_support } else { p.second_pass_min_support };
+        if len < pass_min_len || support < pass_min_support || tandem || redundant {
             rejected += 1;
             if p.verbose {
                 eprintln!(
-                    "  reject: seed count {:>6}  occ {:>3}  len {:>5} (L{}+S{}+R{})  support {:>3}  tandem {}  redundant {}",
+                    "  reject{}: seed count {:>6}  occ {:>3}  len {:>5} (L{}+S{}+R{})  support {:>3}  tandem {}  redundant {}",
+                    pass,
                     count,
                     list.len(),
                     len,
@@ -632,11 +646,21 @@ pub fn build_library(
             }
             continue;
         }
+
+        // Accepted: mark this seed and the consensus spaced seeds as covered so
+        // the same family is not rebuilt from another of its seeds.
+        covered.insert(seed);
+        let ks = spaced_seed_set(&seq, &index.seed);
+        covered.extend(ks.iter().copied());
+        covered12.extend(k12.iter().copied());
+
         built += 1;
+        pass_built += 1;
         if p.verbose {
             eprintln!(
-                "  family {:>5}: len {:>5}  support {:>3}/{:<3}  seed count {}",
+                "  family {:>5} (pass{}): len {:>5}  support {:>3}/{:<3}  seed count {}",
                 built,
+                pass,
                 len,
                 support,
                 list.len(),
@@ -651,6 +675,142 @@ pub fn build_library(
             seed_count: count,
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Second pass: revisit the same occurrence table with relaxed filters.
+    // The pass-1 consensi already populate `covered` and `covered12`, so their
+    // seeds are skipped and new pass-2 consensi are checked against them.
+    // -----------------------------------------------------------------------
+    if p.second_pass && p.second_pass_max_families > 0 {
+        pass = 2;
+        pass_built = 0;
+        pass_candidates = 0;
+        let total_budget = p.max_families + p.second_pass_max_families;
+        let candidate_budget = max_candidates + p.second_pass_max_families.saturating_mul(20);
+        for &(seed, count) in &seeds {
+            if library.len() >= total_budget || candidates >= candidate_budget {
+                break;
+            }
+            if covered.contains(&seed)
+                || crate::kmer::neighbors(seed, weight, 2, true)
+                    .iter()
+                    .any(|n| covered.contains(n))
+            {
+                skipped_covered += 1;
+                continue;
+            }
+            let list = match occs.get(&seed) {
+                Some(l) if l.len() >= p.second_pass_min_support => l,
+                _ => continue,
+            };
+            candidates += 1;
+            pass_candidates += 1;
+            if p.verbose && pass_candidates % 100 == 0 {
+                eprintln!(
+                    "  progress pass2: {} candidates, {} built, {} rejected, {} seeds skipped",
+                    pass_candidates,
+                    pass_built,
+                    rejected,
+                    skipped_covered
+                );
+            }
+
+            let mut lefts = Vec::with_capacity(list.len());
+            let mut rights = Vec::with_capacity(list.len());
+            let mut seed_span: Option<Vec<u8>> = None;
+            for o in list {
+                let rec = o.rec as usize;
+                let pos = o.pos as usize;
+                let start = pos.saturating_sub(p.flank);
+                let end = (pos + span + p.flank).min(dump.record_len(rec));
+                let win = dump.fetch(rec, start, end)?;
+                let seed_off = pos - start;
+                let (win, seed_off) = if o.forward {
+                    (win, seed_off)
+                } else {
+                    let n = win.len();
+                    (revcomp_bytes(&win), n - seed_off - span)
+                };
+                if seed_span.is_none() {
+                    seed_span = Some(win[seed_off..seed_off + span].to_vec());
+                }
+                let mut left = win[..seed_off].to_vec();
+                left.reverse();
+                lefts.push(left);
+                rights.push(win[seed_off + span..].to_vec());
+            }
+
+            let (right_ext, right_scores) = extend(rights, p.band, p.lookahead, p.flank);
+            let (left_ext, left_scores) = extend(lefts, p.band, p.lookahead, p.flank);
+
+            let mut seq: Vec<u8> = left_ext.iter().rev().copied().collect();
+            if let Some(s) = seed_span {
+                seq.extend_from_slice(&s);
+            }
+            seq.extend_from_slice(&right_ext);
+            let seq = trim_runs(seq);
+            let len = seq.len();
+
+            let support = right_scores
+                .iter()
+                .zip(&left_scores)
+                .filter(|(r, l)| (**r + **l + span as i32) as f64 >= 0.25 * len as f64)
+                .count();
+
+            let k12 = kmer_set(&seq, 12);
+            let shared = k12.iter().filter(|x| covered12.contains(x)).count();
+            let redundant = !k12.is_empty() && shared * 10 >= k12.len() * 6;
+
+            let tandem = is_tandem(&seq);
+            if len < p.second_pass_min_len || support < p.second_pass_min_support || tandem || redundant {
+                rejected += 1;
+                if p.verbose {
+                    eprintln!(
+                        "  reject{}: seed count {:>6}  occ {:>3}  len {:>5} (L{}+S{}+R{})  support {:>3}  tandem {}  redundant {}",
+                        pass,
+                        count,
+                        list.len(),
+                        len,
+                        left_ext.len(),
+                        span,
+                        right_ext.len(),
+                        support,
+                        tandem,
+                        redundant
+                    );
+                }
+                continue;
+            }
+
+            // Accepted in pass 2: mark this seed and its consensus as covered.
+            covered.insert(seed);
+            let ks = spaced_seed_set(&seq, &index.seed);
+            covered.extend(ks.iter().copied());
+            covered12.extend(k12.iter().copied());
+
+            built += 1;
+            pass_built += 1;
+            if p.verbose {
+                eprintln!(
+                    "  family {:>5} (pass{}): len {:>5}  support {:>3}/{:<3}  seed count {}",
+                    built,
+                    pass,
+                    len,
+                    support,
+                    list.len(),
+                    count
+                );
+            }
+            library.push(Consensus {
+                id: built,
+                seq,
+                support,
+                occurrences: list.len(),
+                seed_count: count,
+            });
+        }
+    }
+
     if p.verbose {
         eprintln!(
             "built {} consensi; {} seeds skipped as covered, {} candidates rejected",

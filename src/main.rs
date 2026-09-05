@@ -424,6 +424,23 @@ enum Commands {
 
         #[arg(long, default_value_t = false)]
         verbose: bool,
+
+        /// Run a second pass over the same occurrence table with relaxed
+        /// filters to recover low-copy or highly diverged families.
+        #[arg(long, default_value_t = false)]
+        second_pass: bool,
+
+        /// Second-pass minimum consensus length.
+        #[arg(long, default_value_t = 80)]
+        second_pass_min_len: usize,
+
+        /// Second-pass minimum support (copies fitting the consensus).
+        #[arg(long, default_value_t = 5)]
+        second_pass_min_support: usize,
+
+        /// Maximum additional consensi to build in the second pass.
+        #[arg(long, default_value_t = 500)]
+        second_pass_max_families: usize,
     },
 
     /// Convert a soft-masked FASTA to an all-uppercase FASTA.
@@ -1438,6 +1455,10 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         min_support,
         out,
         verbose,
+        second_pass,
+        second_pass_min_len,
+        second_pass_min_support,
+        second_pass_max_families,
     } = args
     else {
         unreachable!()
@@ -1465,6 +1486,10 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         min_len: *min_len,
         min_support: *min_support,
         verbose: *verbose,
+        second_pass: *second_pass,
+        second_pass_min_len: *second_pass_min_len,
+        second_pass_min_support: *second_pass_min_support,
+        second_pass_max_families: *second_pass_max_families,
     };
     let lib = consensus::build_library(&idx, genome, seq_dump, &params)?;
     consensus::write_library(&lib, out)?;

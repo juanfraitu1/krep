@@ -250,7 +250,6 @@ Chr1 vs `chr1_rm_family.bed` (k18@32 + de novo library + tandem/dust):
 | logistic τ=0.50 | 0.9044 | 0.7443 | 0.8166 | 0.4398 | 0.1913 | 0.0496 |
 | logistic τ=0.45 | 0.8824 | 0.7521 | 0.8121 | 0.4481 | 0.2122 | 0.0733 |
 | logistic τ=0.40 | 0.8594 | 0.7602 | 0.8068 | 0.4589 | 0.2337 | 0.1007 |
-| logistic τ=0.35 | 0.8395 | 0.7675 | 0.8019 | 0.4689 | 0.2537 | 0.1279 |
 | logistic τ=0.30 | 0.8249 | **0.7729** | 0.7981 | **0.4772** | **0.2683** | **0.1482** |
 
 The fully de novo pipeline reaches **F1 0.8234 on chr1** at high precision,
@@ -258,6 +257,24 @@ or trades ~12 points of precision for more ancient-family recall (τ=0.3). It
 still trails the Dfam hybrid (F1 ~0.91) and the HMM layer on MIR/L2/CR1, but
 it proves the spaced-seed consensus path works without external repeat
 libraries.
+
+### 7. Two-pass de novo consensus builder
+
+`krep consensus` now has `--second-pass`, `--second-pass-min-len`,
+`--second-pass-min-support`, and `--second-pass-max-families`. The first
+pass builds consensi with the primary filters (length/support/tandem/
+redundancy). The optional second pass iterates over the same occurrence table
+with relaxed filters, skipping seeds already covered by pass-1 consensi and
+checking pass-2 consensi against them for redundancy.
+
+This was motivated by zero dedicated CR1/Helitron/Tip100 consensi in the
+single-pass 1M library: the families are too low-copy or diverged to clear
+the default filters. With `--second-pass-min-len 80 --second-pass-min-support
+5 --second-pass-max-families 500`, the 1M library grew from **943 consensi to
+1,375 consensi** (pass 1 built 1,337, pass 2 added 38). Genome-wide masking
+coverage on chr1–4 with the new library is ~60% vs ~52–55% for the old 1M
+library, so the expansion hits more repeat sequence. Evaluation of the
+resulting learned filter on chr1 is in progress.
 
 ## Remaining tasks, in priority order
 
@@ -279,15 +296,15 @@ libraries.
    cutoffs. Per-region copy-number stats in the BED would let SD-like
    regions be labelled rather than counted as errors.
 4. **Consensus builder tail**: CR1/Helitron/Tip100 had no usable de novo
-   consensi (seeds below count 30 or too diverged). Lower `--min-seed-count`
-   with a longer run, or seed from the spaced index.
+   consensi (seeds below count 30 or too diverged). The two-pass builder
+   addresses this; evaluate the resulting recall/precision on chr1.
 5. **NCBI-style mode** (index@6 + tandem + dust 3) scores F1 0.788 against
-   the NCBI lowercase; matching it closely needs WindowMasker's actual
+   the NCBI lowercase; matching it closely would need WindowMasker's actual
    two-threshold window scoring. Only worth doing if that mask is a target.
 6. **Divergence-aware scoring (revisit later).** Needs family-specific
-   transition/transversion matrices estimated from full alignments, not
-   the gate-window counts. Generic Ti/Tv bias is not supported by the
-   observed accepted-hit spectrum.
+   transition/transversion matrices estimated from full alignments, not the
+   gate-window counts. Generic Ti/Tv bias is not supported by the observed
+   accepted-hit spectrum.
 
 ## Things that will bite the next person
 
@@ -346,11 +363,11 @@ with *another de novo masker*.
 ## What was added
 
 - **`krep index`** — one streaming pass over the genome producing exact
-  genome-wide k-mer counts. Hash sub-sampling (FracMinHash, `--sample`) keeps
-  1 in N k-mers; because the decision depends only on the k-mer's own hash, a
-  tracked k-mer is counted at every occurrence, so counts stay *exact* (unlike a
-  Bloom filter, which inflates via collisions). Buffers spill to disk as sorted
-  runs and are merged in one pass, so peak RAM is `--buffer`, not genome size.
+genome-wide k-mer counts. Hash sub-sampling (FracMinHash, `--sample`) keeps
+1 in N k-mers; because the decision depends only on the k-mer's own hash, a
+tracked k-mer is counted at every occurrence, so counts stay *exact* (unlike a
+Bloom filter, which inflates via collisions). Buffers spill to disk as sorted
+runs and are merged in one pass, so peak RAM is `--buffer`, not genome size.
 - **`krep mask --index`** — streams the target and looks up genome-wide counts.
   Mask chr1 alone while using whole-genome context.
 - **Streaming `compare-mask`** with per-record breakdown (the old one loaded
@@ -566,12 +583,89 @@ Data: `C:\krep_work\dfam_human.fa` (1,403 consensi, headers `name#accession`),
   divergence-aware (transition/transversion) scoring matrix estimated from
   krep's confident alignments; profile HMMs for the ancient families.
 
+## Round 6: de novo spaced-seed consensus (no Dfam/HMM)
+
+The consensus builder now seeds from the dense whole-genome spaced-seed index
+(`chm13.sp16.s1.kidx`). A new `--seed-pool` flag limits how many abundant
+seeds are held for occurrence collection, and the top-K selection uses a
+bounded heap so exploring millions of low-count seeds no longer materialises
+the full candidate list.
+
+```bash
+~/krep_target/release/krep consensus \
+  --genome /mnt/c/Users/jfris/OneDrive/Desktop/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --index /mnt/c/krep_work/chm13.sp16.s1.kidx \
+  --seq-dump /mnt/c/krep_work/chm13.kseq \
+  --out /mnt/c/krep_work/chm13_consensi_sp16_pool500k.fa \
+  --min-seed-count 8 --max-families 2000 --seed-pool 500000 --max-occ 30
+```
+
+This built **537 de novo consensi** in ~4 min at ~1.6 GB peak RAM. The
+library is dominated by Alu/L1/satellite, but also contains real MIR and L2
+fragments (e.g. `krep_fam_00039` = Dfam MIR, `krep_fam_00085/00091` = L2a/MIRb
+3' ends). A logistic hit filter was trained on chr2+3+4 candidates and
+applied to chr1.
+
+Chr1 vs `chr1_rm_family.bed` (k18@32 + de novo library + tandem/dust):
+
+| filter | P | R | F1 | SINE/MIR | LINE/L2 | LINE/CR1 |
+|---|---|---|---|---|---|---|
+| none (score ≥15) | 0.8065 | 0.7794 | 0.7927 | 0.4881 | 0.2853 | 0.1716 |
+| per-consensus thresholds | **0.9422** | 0.7313 | **0.8234** | 0.4283 | 0.1594 | 0.0188 |
+| logistic τ=0.60 | 0.9360 | 0.7325 | 0.8218 | 0.4303 | 0.1624 | 0.0216 |
+| logistic τ=0.50 | 0.9044 | 0.7443 | 0.8166 | 0.4398 | 0.1913 | 0.0496 |
+| logistic τ=0.45 | 0.8824 | 0.7521 | 0.8121 | 0.4481 | 0.2122 | 0.0733 |
+| logistic τ=0.40 | 0.8594 | 0.7602 | 0.8068 | 0.4589 | 0.2337 | 0.1007 |
+| logistic τ=0.30 | 0.8249 | **0.7729** | 0.7981 | **0.4772** | **0.2683** | **0.1482** |
+
+The fully de novo pipeline reaches **F1 0.8234 on chr1** at high precision,
+or trades ~12 points of precision for more ancient-family recall (τ=0.3). It
+still trails the Dfam hybrid (F1 ~0.91) and the HMM layer on MIR/L2/CR1, but
+it proves the spaced-seed consensus path works without external repeat
+libraries.
+
+A larger `--seed-pool 1000000` library reached **943 consensi**. A full
+τ sweep showed that no global threshold can raise ancient-family recall
+without a large precision drop, because the underrepresented families
+(CR1, Helitron, Tip100) have a different feature distribution than the
+dominant Alu/L1/satellite families. This motivated the family-specialist and
+two-pass routes below.
+
+### Round 6a: family-specific rare model
+
+`scripts/train_rare_family_model.py` trains a second logistic model whose
+positive label is "candidate overlaps any of {LINE/CR1, RC/Helitron,
+DNA/hAT-Tip100, LINE/L2, SINE/MIR}" and whose negatives include both
+non-repeat regions and other repeat families. Ensembling it with the main
+model via `scripts/apply_model_offline.py` gave only tiny gains (CR1
+0.0293 → 0.0303 on chr1) because the candidate dump from the single-pass
+1M library already had poor coverage of those targets (~10% of true bases).
+
+### Round 6b: two-pass consensus builder
+
+`krep consensus` now has `--second-pass`, `--second-pass-min-len`,
+`--second-pass-min-support`, and `--second-pass-max-families` (see
+`src/consensus.rs` and `src/main.rs`). The first pass builds consensi with
+the primary filters; the optional second pass iterates over the same
+occurrence table with relaxed filters, skipping seeds already covered by pass
+1 and checking pass-2 consensi against them for redundancy. A bug-fix
+prevents rejected pass-1 candidates from poisoning the covered set; only
+accepted consensi mark their seeds/12-mers as covered.
+
+With `--second-pass-min-len 80 --second-pass-min-support 5
+--second-pass-max-families 500`, the 1M library grew from **943 consensi to
+1,375 consensi** (pass 1 built 1,337, pass 2 added 38). Genome-wide masking
+coverage on chr1–4 with the new library is ~60% vs ~52–55% for the single-pass
+1M library, so the expansion hits substantially more repeat sequence.
+Evaluation of the resulting logistic and rare-family filters on chr1 is
+in progress (see `C:\krep_work\train_eval_pass2c.sh` / `.log`).
+
 ## What would still move it
 
-- **CR1 / Helitron / Tip100 have no usable consensi** (recall ≈ 0). Their
-  seeds sit below count 30 or their copies are too short/diverged for the
-  extension to gather support. Options: lower `--min-seed-count` with a
-  longer run; seed from the spaced-seed index instead of contiguous 18-mers.
+- **CR1 / Helitron / Tip100 have no usable consensi in single-pass mode.**
+  The two-pass builder addresses the *builder* side; the remaining question is
+  whether the learned hit filter can turn the new consensi into real recall
+  gain without hurting precision.
 - **Short diverged fragments** (MIR/L2 at ~150 bp, 65% identity) barely clear
   the 2-hit chain and the score floor. A length-normalized score threshold or
   single-hit triggering for consensi < 400 bp would help sensitivity at a
@@ -606,13 +700,24 @@ Data: `C:\krep_work\dfam_human.fa` (1,403 consensi, headers `name#accession`),
   w16/s22, dense, 560 MB)
 - Consensus libraries: `C:\krep_work\chm13_consensi_v2.fa` (1,124 consensi
   from the contiguous k18 index), `chm13_consensi_sp16_pool500k.fa` (537
-  consensi from the spaced w16/s22 index, fully de novo). Sequence dump
-  `C:\krep_work\chm13.kseq` (3.1 GB, reused by `krep consensus`).
+  consensi from the spaced w16/s22 index, fully de novo), `chm13_consensi_sp16_pool1M.fa`
+  (943 consensi, single-pass), `chm13_consensi_sp16_pool1M_pass2c.fa` (1,375
+  consensi, two-pass). Sequence dump `C:\krep_work\chm13.kseq` (3.1 GB,
+  reused by `krep consensus`).
+- Learned models (spaced-seed de novo): `model_sp16_thresholds.tsv`,
+  `model_sp16_logit.tsv`, `model_sp16_thresholds1M.tsv`,
+  `model_sp16_logit1M.tsv`, `model_sp16_rare1M.tsv`,
+  `model_sp16_thresholds_pass2c.tsv`, `model_sp16_logit_pass2c.tsv`,
+  `model_sp16_rare_pass2c.tsv`.
+- Candidate dumps (spaced-seed de novo): `chr{1,2,3,4}_sp16_cand*.tsv`,
+  combined `chr234_sp16_cand*.tsv`. Used by `scripts/train_thresholds.py`,
+  `scripts/train_logistic.py`, `scripts/train_rare_family_model.py`,
+  `scripts/apply_model_offline.py`.
+- Ground truth: `C:\krep_work\genome_rm_family.bed`, `chr{1,2,3,4}_rm_family.bed`.
 - Mock genomes for regression: `C:\krep_work\mock15.*`, `mock25.*`.
-- RepeatMasker BED: `C:\krep_work\chr1_rm.bed` (merged),
-  `C:\krep_work\chr1_rm_family.bed` (4-column, for per-family recall)
-- Raw annotation: `~/krep_data/rm.out.gz` (from NCBI FTP, 198 MB)
-- Scratch/temp: `C:\krep_work\tmp` (kept off OneDrive deliberately)
+- Launch scripts: `C:\krep_work\build_pool1M.sh`, `dump_pass2c.sh`,
+  `train_eval_pass2c.sh`, `train_rare.sh`, `eval_rare_combo_fast.sh`, plus
+  earlier `run_*.sh`.
 
 ## Build and test
 
@@ -644,4 +749,5 @@ cargo build --release --target-dir ~/krep_target
 cp ~/krep_target/release/krep /mnt/c/krep_work/krep_wsl
 ```
 
-  The chr1 HMM-layer numbers below were produced with `/mnt/c/krep_work/krep_wsl`.
+  The chr1 HMM-layer and two-pass de novo numbers below were produced with
+  `/mnt/c/krep_work/krep_wsl`.
