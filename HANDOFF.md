@@ -1,4 +1,159 @@
-# Handoff: krep vs RepeatMasker on T2T-CHM13
+# krep — handoff (2026-09-04)
+
+Start here. Everything below the "Detailed history" line is the round-by-round
+record; this top section is the current state and what to do next.
+
+## What krep is now
+
+A repeat masker for T2T-CHM13 that works in three layers, all in
+`krep mask`, unioned:
+
+1. **Genome-wide k-mer index** (`krep index`, `--index`): abundance masking
+   with counts measured over the whole genome, hash-subsampled, exact.
+2. **Library alignment** (`--library`): consensus sequences seeded on both
+   strands, banded X-drop extension. Consensi come from `krep consensus`
+   (de novo, RepeatScout-style) or from Dfam. `--lib-single-hit` with
+   `--lib-gate=-4,2` is the sensitive mode; `--lib-model` applies a learned
+   per-consensus filter.
+3. **Tandem + DUST** (`--tandem`, `--dust`): the TRF/DUST half of an
+   NCBI-style mask.
+
+## Final numbers (whole genome, all 24 chromosomes, vs RepeatMasker .out)
+
+| configuration | P | R | F1 | time |
+|---|---|---|---|---|
+| library-free: k18@8 + de novo consensi | 0.937 | 0.767 | 0.844 | 35 min |
+| hybrid: k18@32 + Dfam single-hit −4,2 + tandem + dust | 0.967 | 0.849 | 0.904 | 41 min |
+| **hybrid + logistic hit filter (final)** | **0.9530** | **0.8707** | **0.9100** | 2354.84 s |
+
+Masked 4370062 regions, 1543473801 of 3117275501 bp (49.51%) in 2353.9s. Outputs: `C:\krep_work\chm13_krep_final.bed`,
+`chm13_krep_final_soft.fa` (soft-masked genome), `final_genome_eval*.txt`.
+
+Per family (hybrid → hybrid + logistic filter), genome-wide recall:
+
+| family | hybrid | + filter |
+|---|---|---|
+| SINE/Alu | 0.995 | 0.996 |
+| LINE/L1 | 0.917 | 0.928 |
+| LTR/ERVK | 0.996 | 0.996 |
+| LTR/ERV1 | 0.944 | 0.949 |
+| LTR/ERVL-MaLR | 0.856 | 0.876 |
+| LTR/ERVL | 0.819 | 0.838 |
+| DNA/TcMar-Tigger | 0.870 | 0.884 |
+| DNA/hAT-Charlie | 0.736 | 0.777 |
+| DNA/hAT-Tip100 | 0.660 | 0.704 |
+| RC/Helitron | 0.603 | 0.644 |
+| SINE/MIR | 0.394 | 0.497 |
+| LINE/L2 | 0.310 | 0.412 |
+| LINE/CR1 | 0.253 | 0.344 |
+| Simple_repeat | 0.848 | 0.876 |
+| Satellite/centr | 0.997 | 0.997 |
+
+The remaining gap is the oldest families (L2, MIR, CR1): short fragments at
+~65% identity. Everything younger is at 0.75–0.99.
+
+## Exact final command
+
+```bash
+krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --index chm13.k18.s16.kidx --index-threshold 32 --graph-gap 100 \
+  --library dfam_human.fa --lib-seed 11101001100111 --lib-min-score 15 \
+  --lib-single-hit --lib-gate=-4,2 --lib-model model_logit.tsv \
+  --tandem --dust --min-len 20 --out chm13_krep_final.bed --soft chm13_krep_final_soft.fa
+```
+
+(`--lib-gate=-4,2` must use the `=` form: clap reads a leading `-` as a flag.)
+
+## Data locations (all under `C:\krep_work`, not in git)
+
+- `krep.exe` — final binary (built from commit `417d2da` or later).
+- Indices: `chm13.k18.s16.kidx` (235 MB), `chm13.sp16.s1.kidx` (560 MB,
+  spaced w16 — not used in the final config).
+- Libraries: `dfam_human.fa` (1,403 Dfam human consensi, `name#accession`,
+  fetched via `https://dfam.org/api/families?clade=9606&clade_relatives=ancestors&format=fasta&limit=5000`,
+  JSON-wrapped: unwrap `body`), `chm13_consensi_v2.fa` (1,124 de novo),
+  `krep_plus_dfam.fa` (both).
+- Learned models: `model_logit.tsv` (logistic, trained on chr2),
+  `model_chr2.tsv` (per-consensus floors, chr2), `model_chr1.tsv` (in-sample).
+- Candidate dumps for training: `chr1_cand.tsv`, `chr2_cand.tsv` (1.6M rows
+  each, floor 15).
+- Ground truth: `genome_rm.bed` (merged), `genome_rm_family.bed` (4-column,
+  5.5M rows), `chr1_rm.bed`, `chr1_rm_family.bed`, `chr2_rm_family.bed`;
+  raw `~/krep_data/rm.out.gz`. T2T segdup/censat for chr1 in
+  `~/krep_data/chr1_sedefSegDups.json`, `chr1_censat.json` (UCSC hs1 API).
+- Sequence dump for `krep consensus`: `chm13.kseq` (3.1 GB, reused).
+- Per-chromosome FASTAs: `chm13_chr1_unmasked.fa`, `chm13_chr2_unmasked.fa`.
+- Mock genomes for regression: `mock15.*`, `mock25.*`.
+- Launch scripts used for long runs: `run_genome2.sh`, `run_final.sh`,
+  `run_dump.sh`, `run_gate.sh`.
+
+## Remaining tasks, in priority order
+
+1. **Genome-wide learned filter trained on more than chr2.** The model was
+   trained on one chromosome; dump 3–4 chromosomes (`--lib-dump`), retrain
+   (`scripts/train_logistic.py`), re-evaluate on a held-out chromosome.
+   Expect a small, real gain.
+2. **Gradient boosting over the same features** (needs a Python env with a
+   library, e.g. `pip install lightgbm`; the dumps are ready). The logistic
+   model is nearly linear in length and per-base score; trees can capture
+   the family × divergence interaction. Apply by exporting per-hit
+   decisions or a small tree ensemble to `--lib-model` (new format needed).
+3. **Divergence-aware scoring.** Alignment scoring is match +1 / mismatch −1
+   / gap −3 everywhere. Estimate a transition/transversion matrix from
+   krep's confident alignments and let the aligner use it; RepeatMasker's
+   gains on ancient families come partly from divergence-specific matrices.
+4. **Profile HMMs for MIR / L2 / CR1.** Dfam ships each family as an HMM;
+   nhmmer-style search is what finds ancient fragments a single consensus
+   cannot. Largest engineering item, largest recall headroom
+   (L2 0.42 / MIR 0.52 / CR1 0.36 today).
+5. **Precision side.** ~3% FP genome-wide: segmental duplications and gene
+   families masked by the k-mer index (real repeats RepeatMasker does not
+   annotate), boundary overhang, and library hits below RepeatMasker's own
+   cutoffs. Per-region copy-number stats in the BED would let SD-like
+   regions be labelled rather than counted as errors.
+6. **NCBI-style mode** (index@6 + tandem + dust 3) scores F1 0.788 against
+   the NCBI lowercase; matching it closely needs WindowMasker's actual
+   two-threshold window scoring. Only worth doing if that mask is a target.
+7. **Consensus builder tail**: CR1/Helitron/Tip100 had no usable de novo
+   consensi (seeds below count 30 or too diverged). Lower `--min-seed-count`
+   with a longer run, or seed from the spaced index.
+
+## Things that will bite the next person
+
+- **Windows Application Control (os error 4551)** blocks freshly built
+  executables at random — it hit the test harness and Cargo build scripts.
+  Tests run in WSL (`~/.cargo/bin/cargo test --release --target-dir
+  ~/krep_target`, Rust + build-essential installed); the release `.exe` is
+  built with the Windows toolchain from WSL and run from `C:\krep_work`.
+  The exe cannot be overwritten while a run holds it: copy to a new name.
+- **Host memory is tight (8 GB, WSL reserves up to 3.8 GB).** The agent
+  harness kills its own background tasks when the host runs low; detached
+  jobs (`setsid nohup script &`) survive. Run one krep process at a time
+  and poll its log with bounded foreground loops.
+- **Killing processes by name**: `pkill -f` and `ps | grep | kill` match
+  the calling shell's own command line if the pattern appears in it — this
+  killed the working shell twice. Use `[k]rep` bracket patterns and never
+  include the pattern text elsewhere in the same command.
+- The shell's working directory resets between tool calls in this harness;
+  scripts that touch the repo must `cd` explicitly.
+- `krep evaluate` treats BED column 4 as the family label; `krep mask`
+  writes `consensus:score` there for library hits — fine for evaluation of
+  the prediction, but don't feed a prediction BED as *truth*.
+- Windows exe wants `C:/...` paths; WSL tools want `/mnt/c/...`.
+
+## Build
+
+```bash
+export PATH="/mnt/c/mingw64/bin:$PATH"
+/mnt/c/Users/jfris/.cargo/bin/cargo.exe build --release --target-dir target3
+cp target3/release/krep.exe /mnt/c/krep_work/krep.exe
+~/.cargo/bin/cargo test --release --target-dir ~/krep_target     # 52 tests
+```
+
+---
+
+# Detailed history
+
 
 ## The two things that were wrong
 

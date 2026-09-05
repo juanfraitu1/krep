@@ -269,6 +269,10 @@ put most of the remaining signal in hit length and per-base score. The
 training scripts are plain Python (no NumPy) and take a few minutes on ~1.6M
 candidates.
 
+**Whole genome with the learned filter** (hybrid + logistic model trained on
+chr2): **P 0.9530 / R 0.8707 / F1 0.9100**, 2354.84 s — the final
+configuration; see `HANDOFF.md` for the exact command and outputs.
+
 Whether to use this is a policy choice: with Dfam, krep is no longer library-free.
 
 ### NCBI-style masking (WindowMasker + TRF + DUST)
