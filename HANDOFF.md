@@ -199,6 +199,21 @@ other nine Dfam CR1 keys (`CR1-16_AMi`, `CR1-13_AMi`, `CR1-12_AMi`,
 F1 cost. The merged layer costs ~0.8 points of precision but buys 3.2 points
 of recall and lifts F1 by 0.014 on chr1.
 
+Example chr1 invocation (uses the WSL binary because the fresh Windows build
+is currently blocked by Application Control):
+
+```bash
+/mnt/c/krep_work/krep_wsl mask \
+  --genome /mnt/c/krep_work/chm13_chr1_unmasked.fa \
+  --index /mnt/c/krep_work/chm13.k18.s16.kidx --index-threshold 32 --graph-gap 100 \
+  --library /mnt/c/krep_work/dfam_human.fa --lib-seed 11101001100111 \
+  --lib-min-score 15 --lib-single-hit --lib-gate=-4,2 \
+  --lib-model /mnt/c/krep_work/model_logit.tsv \
+  --tandem --dust --min-len 20 \
+  --hmm-bed /mnt/c/krep_work/hmm_mir_l2_cr1_chr1.bed \
+  --out /tmp/chr1_final_logit_hmm.bed
+```
+
 ## Remaining tasks, in priority order
 
 1. **Whole-genome HMM-layer run.** The chr1 gain is large; confirm it on
