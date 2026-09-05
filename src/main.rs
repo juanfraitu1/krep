@@ -220,6 +220,14 @@ enum Commands {
         #[arg(long, value_name = "TSV")]
         lib_dump: Option<PathBuf>,
 
+        /// Write per-hit A/C/G/T substitution counts from the gate windows
+        /// around accepted library hits. Columns: chrom, start, end,
+        /// consensus, strand, score, then 16 counts (consensus rows A,C,G,T
+        /// x genome columns A,C,G,T). Used to estimate a divergence-aware
+        /// scoring matrix.
+        #[arg(long, value_name = "TSV")]
+        lib_subst_dump: Option<PathBuf>,
+
         /// Learned per-consensus minimum scores (TSV `name<TAB>min_score`);
         /// a hit must clear both this and --lib-min-score.
         #[arg(long, value_name = "TSV")]
@@ -594,6 +602,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         lib_single_hit,
         lib_gate,
         lib_dump,
+        lib_subst_dump,
         lib_model,
         tandem,
         tandem_max_period,
@@ -668,6 +677,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             tandem_params,
             if *dust { Some((*dust_window, *dust_threshold)) } else { None },
             lib_dump.as_deref(),
+            lib_subst_dump.as_deref(),
             out,
             out_format,
             soft.as_deref(),
@@ -1157,6 +1167,7 @@ fn run_mask_indexed(
     tandem_params: Option<tandem::TandemParams>,
     dust: Option<(usize, f64)>,
     lib_dump: Option<&std::path::Path>,
+    lib_subst_dump: Option<&std::path::Path>,
     out: &PathBuf,
     out_format: &OutputFormat,
     soft: Option<&std::path::Path>,
@@ -1226,6 +1237,15 @@ fn run_mask_indexed(
         }
         None => None,
     };
+    let mut subst_writer = match lib_subst_dump {
+        Some(p) => {
+            use std::io::Write as _;
+            let mut w = std::io::BufWriter::new(fs::File::create(p)?);
+            writeln!(w, "chrom\tstart\tend\tconsensus\tstrand\tscore\tAA\tAC\tAG\tAT\tCA\tCC\tCG\tCT\tGA\tGC\tGG\tGT\tTA\tTC\tTG\tTT")?;
+            Some(w)
+        }
+        None => None,
+    };
     let mut stream = fasta::FastaStream::open(genome)?;
     let mut soft_writer = match soft {
         Some(p) => Some(fasta::FastaWriter::create(p)?),
@@ -1247,9 +1267,9 @@ fn run_mask_indexed(
         };
         if let Some(lib) = library {
             let (lib_regions, cands) = lib.mask_record_with_candidates(&rec.header, &rec.seq);
+            let id = fasta::seq_id(&rec.header);
             if let Some(w) = dump_writer.as_mut() {
                 use std::io::Write as _;
-                let id = fasta::seq_id(&rec.header);
                 for c in &cands {
                     let win = &rec.seq[c.start..c.end];
                     let gc = win.iter().filter(|&&b| b == b'G' || b == b'C').count() as f64
@@ -1261,6 +1281,21 @@ fn run_mask_indexed(
                         c.score, c.score_fwd, c.score_bwd, c.cons_fwd, c.cons_bwd, c.cons_len,
                         c.gate_left, c.gate_right, gc
                     )?;
+                }
+            }
+            if let Some(w) = subst_writer.as_mut() {
+                use std::io::Write as _;
+                for c in &cands {
+                    let counts = lib.subst_counts(&rec.seq, c);
+                    write!(
+                        w,
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        id, c.start, c.end, lib.names[c.cid], if c.strand { '+' } else { '-' }, c.score
+                    )?;
+                    for cnt in counts {
+                        write!(w, "\t{}", cnt)?;
+                    }
+                    writeln!(w)?;
                 }
             }
             regions.extend(lib_regions);

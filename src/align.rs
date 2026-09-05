@@ -50,6 +50,10 @@ pub struct Candidate {
     pub cons_len: usize,
     pub gate_left: i32,
     pub gate_right: i32,
+    /// Anchor position in the consensus and genome; used for substitution
+    /// diagnostics around the seed.
+    pub cons_pos: usize,
+    pub genome_pos: usize,
 }
 
 pub struct Library {
@@ -498,6 +502,39 @@ impl Library {
         (sl, sr)
     }
 
+    /// Count A/C/G/T substitutions in the gate windows around a hit.
+    /// Returns a 4x4 matrix flattened in row-major order with consensus bases
+    /// as rows (A,C,G,T) and genome bases as columns.
+    pub fn subst_counts(&self, seq: &[u8], c: &Candidate) -> [u64; 16] {
+        let mut counts = [0u64; 16];
+        let oi = 2 * c.cid + if c.strand { 0 } else { 1 };
+        let cons = &self.seqs[oi];
+        let span = self.span;
+        let cpos = c.cons_pos;
+        let gpos = c.genome_pos;
+        let left = cpos.min(gpos).min(32);
+        let (cr, gr) = (cpos + span, gpos + span);
+        let right = cons.len().saturating_sub(cr).min(seq.len().saturating_sub(gr)).min(32);
+        let idx = |b: u8| match b {
+            b'A' | b'a' => 0,
+            b'C' | b'c' => 1,
+            b'G' | b'g' => 2,
+            b'T' | b't' => 3,
+            _ => return 4,
+        };
+        for o in 0..left {
+            let ci = idx(cons[cpos - 1 - o]);
+            let gi = idx(seq[gpos - 1 - o]);
+            if ci < 4 && gi < 4 { counts[ci * 4 + gi] += 1; }
+        }
+        for o in 0..right {
+            let ci = idx(cons[cr + o]);
+            let gi = idx(seq[gr + o]);
+            if ci < 4 && gi < 4 { counts[ci * 4 + gi] += 1; }
+        }
+        counts
+    }
+
     /// Extend from an anchored seed in both directions (gate first).
     fn extend_hit(&self, seq: &[u8], oi: usize, cpos: usize, gpos: usize) -> Option<Candidate> {
         self.gate(seq, oi, cpos, gpos)?;
@@ -553,6 +590,8 @@ impl Library {
                 cons_len: cons.len(),
                 gate_left: gl,
                 gate_right: gr,
+                cons_pos: cpos,
+                genome_pos: gpos,
             })
         } else {
             None
