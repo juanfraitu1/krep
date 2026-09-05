@@ -204,7 +204,11 @@ of recall and lifts F1 by 0.014 on chr1.
 1. **Whole-genome HMM-layer run.** The chr1 gain is large; confirm it on
    all 24 chromosomes against `genome_rm_family.bed`. The main cost is
    running `nhmmer` once per family on the whole genome; the `krep mask`
-   merge is cheap (~2.6 min on chr1).
+   merge is cheap (~2.6 min on chr1). *Current blocker:* `makehmmerdb` on
+   the 3 GB whole-genome FASTA is being killed in WSL (max ~4 GB dynamic
+   memory), and `nhmmer` directly on the FASTA also exits immediately.
+   Workarounds: (a) run on a machine with more WSL memory, (b) split by
+   chromosome and merge per-family BEDs, (c) use a non-WSL HMMER build.
 2. **Short diverged fragments in single-hit mode.** A length-normalized score
    threshold or a separate path for short consensi (< 400 bp) could rescue
    some MIR/L2 at a measurable precision cost. The sub-15 score band shows
