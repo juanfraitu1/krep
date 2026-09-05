@@ -396,6 +396,16 @@ impl Library {
                 for &(_, oi, cpos) in cands.iter() {
                     if let Some(c) = self.extend_gated(seq, oi as usize, cpos as usize, g) {
                         masked_until = c.end;
+                        // Also memoize the diagonal at the hit's end. Without
+                        // this, a weak similarity that only just clears
+                        // min_score is accepted every few bases along the same
+                        // diagonal — each "hit" is short, so masking barely
+                        // advances and the DP grinds continuously (at
+                        // min_score 5 a chromosome took 45x longer than at
+                        // 15). Real hits are longer than CHAIN_WINDOW, so
+                        // memoizing past their end costs at most a few bases
+                        // of an adjacent tandem copy.
+                        failed[oi as usize] = (c.end as u32, g as i64 - cpos as i64);
                         regions.push(c);
                         break;
                     }

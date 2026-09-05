@@ -73,48 +73,101 @@ krep mask --genome GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
   fetched via `https://dfam.org/api/families?clade=9606&clade_relatives=ancestors&format=fasta&limit=5000`,
   JSON-wrapped: unwrap `body`), `chm13_consensi_v2.fa` (1,124 de novo),
   `krep_plus_dfam.fa` (both).
-- Learned models: `model_logit.tsv` (logistic, trained on chr2),
-  `model_chr2.tsv` (per-consensus floors, chr2), `model_chr1.tsv` (in-sample).
-- Candidate dumps for training: `chr1_cand.tsv`, `chr2_cand.tsv` (1.6M rows
-  each, floor 15).
+- Learned models: `model_logit.tsv` (logistic, chr2-only, production),
+  `model_logit_234.tsv` (chr2+3+4, floor 15), `model_logit10.tsv`
+  (chr2+3+4, floor 10), `model_chr2.tsv` (per-consensus floors, chr2),
+  `model_chr1.tsv` (in-sample).
+- Candidate dumps for training: `chr{1,2,3,4}_cand.tsv` (floor 15) and
+  `chr{1,2,3,4}_cand10.tsv` (floor 10), columns consumed by
+  `scripts/train_logistic.py` and `scripts/train_gbm.py`.
 - Ground truth: `genome_rm.bed` (merged), `genome_rm_family.bed` (4-column,
-  5.5M rows), `chr1_rm.bed`, `chr1_rm_family.bed`, `chr2_rm_family.bed`;
-  raw `~/krep_data/rm.out.gz`. T2T segdup/censat for chr1 in
-  `~/krep_data/chr1_sedefSegDups.json`, `chr1_censat.json` (UCSC hs1 API).
+  5.5M rows), `chr1_rm.bed`, `chr1_rm_family.bed`, `chr2_rm_family.bed`,
+  `chr3_rm_family.bed`, `chr4_rm_family.bed`; raw `~/krep_data/rm.out.gz`.
+  T2T segdup/censat for chr1 in `~/krep_data/chr1_sedefSegDups.json`,
+  `chr1_censat.json` (UCSC hs1 API).
 - Sequence dump for `krep consensus`: `chm13.kseq` (3.1 GB, reused).
-- Per-chromosome FASTAs: `chm13_chr1_unmasked.fa`, `chm13_chr2_unmasked.fa`.
+- Per-chromosome FASTAs: `chm13_chr1_unmasked.fa`, `chm13_chr2_unmasked.fa`,
+  `chm13_chr3_unmasked.fa`, `chm13_chr4_unmasked.fa`.
 - Mock genomes for regression: `mock15.*`, `mock25.*`.
-- Launch scripts used for long runs: `run_genome2.sh`, `run_final.sh`,
-  `run_dump.sh`, `run_gate.sh`.
+- Launch scripts: `run_genome2.sh`, `run_final.sh`, `run_dump.sh`,
+  `run_gate.sh`, `run_dump34.sh`, `run_dump10.sh`, `run_train234.sh`,
+  `run_train10.sh`, `run_gbm.sh`, `run_gbm10.sh`.
+
+## Latest work
+
+### 1. Learned filter: more training data
+
+Dumped chr3 and chr4 library-alignment candidates (floor 15, 1.36M and
+1.34M rows) and retrained the logistic filter on chr2+chr3+chr4.
+Held-out chr1 applied result:
+
+| model | train set | P | R | F1 |
+|---|---|---|---|---|
+| `model_logit.tsv` | chr2 only | 0.9759 | 0.8497 | **0.9085** |
+| `model_logit_234.tsv` | chr2+3+4 | 0.9753 | 0.8498 | **0.9082** |
+
+Offline (candidate-level) evaluation: 0.9008 vs 0.9005. Conclusion:
+**the logistic filter is saturated on its current features**; more
+same-distribution training data does not move it.
+
+### 2. Gradient boosting
+
+Added `scripts/train_gbm.py` (LightGBM, same features + consensus as a
+native categorical). GBM on floor-15 data: F1 **0.9019** (vs logistic
+0.9008 offline). On floor-10 data it reached only **0.8927** because
+the lower floor floods the candidate set with weak noise the tree model
+still cannot separate from true ancient fragments.
+
+### 3. Sub-15 candidate floor: alignment memo fix
+
+At `--lib-min-score 5` the single-hit aligner ground to a halt (55+ min
+for chr2). The cause: a *successful* banded DP never updated the failed-
+diagonal memo, so weak accepted hits re-triggered DPs every few bases
+along the same diagonal. Fixed in `src/align.rs` by memoizing the diagonal
+at the hit's end. After the fix:
+
+- floor-15 chr1 regression unchanged: **P 0.9759 / R 0.8497 / F1 0.9084**
+  (was 0.9085), and ~13% faster.
+- floor-10 dumps run in ~80 s per chromosome, faster than the old
+  floor-15 time.
+
+Headroom check on chr2 (partial dump at floor 5):
+
+| floor | recall ceiling (kept bases vs RM) |
+|---|---|
+| 15 | 0.8406 |
+| 10 | 0.9057 |
+| 8  | 0.9164 |
+| 5  | 0.9189 |
+
+There is real signal in the 10–15 score band, but the current learned
+features cannot exploit it without measurable precision loss. The aligner
+itself (gate, seed weight, scoring matrix) has to get better before a
+post-hoc filter can turn that signal into recall gain.
 
 ## Remaining tasks, in priority order
 
-1. **Genome-wide learned filter trained on more than chr2.** The model was
-   trained on one chromosome; dump 3–4 chromosomes (`--lib-dump`), retrain
-   (`scripts/train_logistic.py`), re-evaluate on a held-out chromosome.
-   Expect a small, real gain.
-2. **Gradient boosting over the same features** (needs a Python env with a
-   library, e.g. `pip install lightgbm`; the dumps are ready). The logistic
-   model is nearly linear in length and per-base score; trees can capture
-   the family × divergence interaction. Apply by exporting per-hit
-   decisions or a small tree ensemble to `--lib-model` (new format needed).
-3. **Divergence-aware scoring.** Alignment scoring is match +1 / mismatch −1
+1. **Divergence-aware scoring.** Alignment scoring is match +1 / mismatch −1
    / gap −3 everywhere. Estimate a transition/transversion matrix from
    krep's confident alignments and let the aligner use it; RepeatMasker's
    gains on ancient families come partly from divergence-specific matrices.
-4. **Profile HMMs for MIR / L2 / CR1.** Dfam ships each family as an HMM;
+   Should also make the sub-15 score band usable.
+2. **Profile HMMs for MIR / L2 / CR1.** Dfam ships each family as an HMM;
    nhmmer-style search is what finds ancient fragments a single consensus
    cannot. Largest engineering item, largest recall headroom
    (L2 0.42 / MIR 0.52 / CR1 0.36 today).
-5. **Precision side.** ~3% FP genome-wide: segmental duplications and gene
+3. **Short diverged fragments in single-hit mode.** A length-normalized score
+   threshold or a separate path for short consensi (< 400 bp) could rescue
+   some MIR/L2 at a measurable precision cost.
+4. **Precision side.** ~3% FP genome-wide: segmental duplications and gene
    families masked by the k-mer index (real repeats RepeatMasker does not
    annotate), boundary overhang, and library hits below RepeatMasker's own
    cutoffs. Per-region copy-number stats in the BED would let SD-like
    regions be labelled rather than counted as errors.
-6. **NCBI-style mode** (index@6 + tandem + dust 3) scores F1 0.788 against
+5. **NCBI-style mode** (index@6 + tandem + dust 3) scores F1 0.788 against
    the NCBI lowercase; matching it closely needs WindowMasker's actual
    two-threshold window scoring. Only worth doing if that mask is a target.
-7. **Consensus builder tail**: CR1/Helitron/Tip100 had no usable de novo
+6. **Consensus builder tail**: CR1/Helitron/Tip100 had no usable de novo
    consensi (seeds below count 30 or too diverged). Lower `--min-seed-count`
    with a longer run, or seed from the spaced index.
 
