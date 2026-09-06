@@ -58,6 +58,10 @@ pub struct Params {
     pub second_pass_min_support: usize,
     /// Maximum additional consensi to build in the second pass.
     pub second_pass_max_families: usize,
+    /// Occurrences sampled per seed in the second pass. Larger than `max_occ`
+    /// lets low-copy or highly diverged families gather enough supporting
+    /// windows for a consensus.
+    pub second_pass_max_occ: usize,
 }
 
 const NEG_INF: i32 = i32::MIN / 4;
@@ -677,14 +681,26 @@ pub fn build_library(
     }
 
     // -----------------------------------------------------------------------
-    // Second pass: revisit the same occurrence table with relaxed filters.
-    // The pass-1 consensi already populate `covered` and `covered12`, so their
-    // seeds are skipped and new pass-2 consensi are checked against them.
+    // Second pass: revisit the same seed list with relaxed filters. If pass 2
+    // needs more occurrences than pass 1, collect a deeper occurrence table
+    // now; otherwise reuse `occs`.
     // -----------------------------------------------------------------------
     if p.second_pass && p.second_pass_max_families > 0 {
         pass = 2;
         pass_built = 0;
         pass_candidates = 0;
+        let second_occ = if p.second_pass_max_occ > p.max_occ {
+            collect_occurrences(
+                genome,
+                dump_path,
+                &seed_set,
+                seed,
+                p.second_pass_max_occ,
+                p.verbose,
+            )?
+        } else {
+            occs
+        };
         let total_budget = p.max_families + p.second_pass_max_families;
         let candidate_budget = max_candidates + p.second_pass_max_families.saturating_mul(20);
         for &(seed, count) in &seeds {
@@ -699,7 +715,7 @@ pub fn build_library(
                 skipped_covered += 1;
                 continue;
             }
-            let list = match occs.get(&seed) {
+            let list = match second_occ.get(&seed) {
                 Some(l) if l.len() >= p.second_pass_min_support => l,
                 _ => continue,
             };

@@ -441,6 +441,12 @@ enum Commands {
         /// Maximum additional consensi to build in the second pass.
         #[arg(long, default_value_t = 500)]
         second_pass_max_families: usize,
+
+        /// Occurrences sampled per seed in the second pass. Larger than
+        /// `--max-occ` lets low-copy or diverged families gather enough
+        /// supporting windows.
+        #[arg(long, default_value_t = 20)]
+        second_pass_max_occ: usize,
     },
 
     /// Convert a soft-masked FASTA to an all-uppercase FASTA.
@@ -1459,6 +1465,7 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         second_pass_min_len,
         second_pass_min_support,
         second_pass_max_families,
+        second_pass_max_occ,
     } = args
     else {
         unreachable!()
@@ -1490,6 +1497,7 @@ fn run_consensus(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         second_pass_min_len: *second_pass_min_len,
         second_pass_min_support: *second_pass_min_support,
         second_pass_max_families: *second_pass_max_families,
+        second_pass_max_occ: *second_pass_max_occ,
     };
     let lib = consensus::build_library(&idx, genome, seq_dump, &params)?;
     consensus::write_library(&lib, out)?;

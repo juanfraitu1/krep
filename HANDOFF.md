@@ -674,6 +674,27 @@ Helitron remain low even after the second pass because the consensus builder
 still finds almost no CR1/Helitron seeds that clear the minimum requirements
 in either pass.
 
+Relaxing pass-2 filters further (`--second-pass-min-len 60`, `--second-pass-min-support 4`) added only 4 consensi (1,379); lowering to length 50 / support 3 added 9 (1,384). The dominant rejection reason is 12-mer redundancy, not length/support, so the same occurrence table is saturated.
+
+Adding a **deeper pass-2 occurrence table** (`--second-pass-max-occ 100`,
+collecting up to 100 occurrences per seed instead of 20) raised the library
+to **1,397 consensi** (60 pass-2 consensi). The extra occurrences help more
+than looser filters, but the run cost jumps to ~42 min and ~3.5 GB peak RAM.
+
+Combining the best de novo library (`chm13_consensi_sp16_pool1M_pass2f.fa`)
+with the k18 index + tandem + dust on chr1 (no learned filter yet):
+
+| configuration | P | R | F1 | Tip100 | CR1 | L2 | MIR |
+|---|---|---|---|---|---|---|---|
+| pass2f library-only + main model | 0.9583 | 0.7350 | 0.8319 | 0.1230 | 0.0161 | 0.1920 | 0.4090 |
+| pass2f + k18@32 + tandem + dust (raw) | 0.7293 | **0.8419** | 0.7816 | 0.4381 | 0.3264 | 0.4817 | 0.5802 |
+
+The raw hybrid reaches **84.2% recall** and excellent ancient-family recall,
+but precision is only 0.73 because the unfiltered library over-masks. A
+learned hit filter trained on chr2–4 candidates from this exact hybrid
+configuration is the next step; it should recover most of the lost precision
+while keeping much of the recall gain.
+
 ## What would still move it
 
 - **CR1 / Helitron / Tip100 have no usable consensi in single-pass mode.**
