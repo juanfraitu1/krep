@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Combine existing de-novo consensus labels with labels for Dfam rare consensi."""
+"""Combine existing de-novo consensus labels with labels for added rare consensi.
+
+usage: make_augmented_labels.py <existing_labels.tsv> <added_fa[,added_fa2,...]> <out.tsv> [label]
+"""
 import sys, re
 
-existing_labels = sys.argv[1]  # consensus_family_labels_*.tsv
-rare_fa = sys.argv[2]
+existing_labels = sys.argv[1]
+added_paths = sys.argv[2]
 out = sys.argv[3]
+forced_label = sys.argv[4] if len(sys.argv) > 4 else None
 
 GROUPS = [
     ('SINE/Alu', {'SINE/Alu'}),
@@ -26,8 +30,13 @@ GROUPS = [
 ]
 
 def family_of_name(name):
-    # name like "MIR#DF000000001.4" or "CR1_Mam#..."
     base = name.split('#')[0]
+    # explicit de novo headers like LINE/CR1_denovo
+    if base.endswith('_denovo'):
+        return base.replace('_denovo', '').replace('_', '/')
+    # variants keep original family; infer from name
+    if '_var' in base:
+        base = base.split('_var')[0]
     if re.search(r'\bAlu\b', base): return 'SINE/Alu'
     if re.search(r'\bL1\b', base): return 'LINE/L1'
     if 'ERVK' in base: return 'LTR/ERVK'
@@ -43,7 +52,7 @@ def family_of_name(name):
     if 'L2' in base: return 'LINE/L2'
     if 'CR1' in base: return 'LINE/CR1'
     if 'Helitron' in base: return 'RC/Helitron'
-    return 'Unknown'
+    return forced_label or 'Unknown'
 
 with open(out, 'w') as f:
     # copy existing
@@ -52,18 +61,19 @@ with open(out, 'w') as f:
             f.write(l)
             continue
         f.write(l)
-    # add Dfam rare entries
-    name = None; seqlen = 0
-    for l in open(rare_fa):
-        if l.startswith('>'):
-            if name is not None:
-                fam = family_of_name(name)
-                f.write(f"{name}\t{fam}\t0\t{seqlen}\t0.0000\n")
-            name = l[1:].split()[0]
-            seqlen = 0
-        else:
-            seqlen += len(l.strip())
-    if name is not None:
-        fam = family_of_name(name)
-        f.write(f"{name}\t{fam}\t0\t{seqlen}\t0.0000\n")
+    # add new fasta entries
+    for fa_path in added_paths.split(','):
+        name = None; seqlen = 0
+        for l in open(fa_path):
+            if l.startswith('>'):
+                if name is not None:
+                    fam = family_of_name(name)
+                    f.write(f"{name}\t{fam}\t0\t{seqlen}\t0.0000\n")
+                name = l[1:].split()[0]
+                seqlen = 0
+            else:
+                seqlen += len(l.strip())
+        if name is not None:
+            fam = family_of_name(name)
+            f.write(f"{name}\t{fam}\t0\t{seqlen}\t0.0000\n")
 print("wrote", out)

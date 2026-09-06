@@ -399,7 +399,7 @@ impl Library {
         }
 
         let n = self.names.len();
-        let mut group_id = vec![n_groups; n]; // default to last group if unassigned
+        let mut group_id = vec![n_groups.saturating_sub(1); n];
         let mut offsets = vec![vec![0.0; n]; n_groups];
         for (i, name) in self.names.iter().enumerate() {
             if let Some(&(gid, off)) = assignments.get(name.as_str()) {

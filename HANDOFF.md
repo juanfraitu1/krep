@@ -68,33 +68,31 @@ precision gain but no rare-family recall lift (the library simply lacks
 CR1/Helitron consensi).
 
 Adding 29 rare Dfam consensi (CR1, Helitron, MIR, L2, Tip100) to the library
-and retraining the per-group model closes much of the gap on chr1:
+and applying **per-consensus score thresholds** closes much of the gap on chr1.
+The full per-family-group logistic is more aggressive but measurably less
+precise; it helps rare recall only at a net F1 loss.
 
-| chr1 config | P | R | F1 |
+| chr1 config (library-only, single-hit −4,2) | P | R | F1 |
 |---|---|---|---|
 | de novo + global logistic | 0.9320 | 0.7649 | 0.8402 |
 | de novo + per-family model | 0.9394 | 0.7624 | 0.8417 |
-| de novo+Dfam rare + per-family model | 0.9327 | 0.7849 | **0.8524** |
-| de novo+Dfam rare + per-family + k18/tandem/dust | 0.9230 | 0.7913 | **0.8521** |
+| de novo+Dfam rare + per-consensus thresholds (score) | **0.9377** | **0.7844** | **0.8542** |
+| de novo+Dfam rare + per-family model | 0.8196 | 0.8195 | 0.8195 |
 
 Per-family recall (rare families) with the augmented library:
 
-| family | recall |
-|---|---|
-| SINE/Alu | 0.9891 |
-| LINE/L1 | 0.8363 |
-| LTR/ERVK | 0.8935 |
-| LTR/ERV1 | 0.6981 |
-| LTR/ERVL-MaLR | 0.7238 |
-| LTR/ERVL | 0.4731 |
-| DNA/hAT-Tip100 | 0.1590 |
-| SINE/MIR | 0.5444 |
-| LINE/L2 | 0.4534 |
-| LINE/CR1 | 0.1064 |
-| RC/Helitron | 0.6803 |
+| family | per-consensus thresholds | per-family model |
+|---|---|---|
+| DNA/hAT-Tip100 | 0.2943 | 0.4134 |
+| SINE/MIR | 0.5833 | 0.6247 |
+| LINE/L2 | 0.5051 | 0.5712 |
+| LINE/CR1 | 0.1710 | 0.3002 |
+| RC/Helitron | 0.6813 | 0.7304 |
 
 Files: `chm13_consensi_sp16_pool1M_pass2f_rare.fa`,
-`model_family_groups_pass2f_rare.tsv`,
+`model_family_groups_pass2f_rare_scorethr_thresholds.tsv` (score-based
+per-consensus thresholds),
+`model_family_groups_pass2f_rare.tsv` (full per-family model),
 `consensus_family_labels_pass2f_rare.tsv`.
 
 ## Exact final command
@@ -317,6 +315,42 @@ the default filters. With `--second-pass-min-len 80 --second-pass-min-support
 coverage on chr1–4 with the new library is ~60% vs ~52–55% for the old 1M
 library, so the expansion hits more repeat sequence. Evaluation of the
 resulting learned filter on chr1 is in progress.
+
+### 8. Rare-family augmentation: real de-novo consensi and simulated variants
+
+Two additional library-augmentation strategies were tested against the strong
+Dfam-rare + per-consensus-threshold baseline on chr1:
+
+- **Real de-novo rare consensi (v3).** CR1/Helitron/MIR/L2/Tip100 intervals
+  were extracted from chr2–4 RepeatMasker annotations and collapsed into
+  mini-consensi (`scripts/extract_rare_intervals.py`), then added to the
+  library with no simulated variants. The resulting v3 library has 1,431
+  consensi.
+- **Simulated variants (rare2).** Each Dfam rare consensus was mutated at
+  ~30% divergence to produce additional library sequences
+  (`scripts/simulate_rare_variants.py`).
+
+| chr1 config (per-consensus score thresholds) | P | R | F1 | CR1 | Helitron | L2 | MIR | Tip100 |
+|---|---|---|---|---|---|---|---|---|
+| Dfam rare only (baseline) | 0.9377 | 0.7844 | **0.8542** | 0.1710 | 0.6813 | 0.5051 | 0.5833 | 0.2943 |
+| + real de-novo rare (v3) | 0.9395 | 0.7829 | 0.8540 | 0.1720 | 0.6789 | 0.5059 | 0.5842 | 0.2934 |
+| + simulated variants (rare2) | 0.9361 | 0.7838 | 0.8532 | 0.1852 | 0.6952 | 0.5092 | 0.5852 | 0.2958 |
+| v3 + Ancient thresholds floored to 18 | 0.9285 | 0.7854 | 0.8510 | 0.1904 | 0.7038 | 0.5091 | 0.5862 | 0.3070 |
+
+Neither augmentation improves overall F1 over the Dfam-only baseline. The full
+per-family logistic on v3 is better for rare recall (CR1 0.3002, Helitron 0.7299)
+but drops overall precision to 0.8185 and F1 to 0.8189.
+
+Conclusion: **adding more rare consensus sequences is not the bottleneck**.
+The remaining missed ancient bases are below the current seed/gate sensitivity;
+closing them further needs a more sensitive alignment path (lower seed weight,
+separate rare-family HMM/fragment model, or the existing `--hmm-bed` layer)
+rather than more consensi or a stronger post-hoc filter.
+
+Files: `chm13_consensi_sp16_pool1M_pass2f_rare3.fa`,
+`chm13_consensi_sp16_pool1M_pass2f_rare2.fa`,
+`model_v3_perconsensus_thresholds.tsv`,
+`model_rare2_perconsensus_thresholds.tsv`.
 
 ## Remaining tasks, in priority order
 

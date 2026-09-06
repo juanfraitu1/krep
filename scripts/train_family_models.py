@@ -12,6 +12,10 @@ import sys, os, bisect, math, random, tempfile
 from collections import defaultdict
 
 train_p, train_rm, labels_p, test_p, test_rm, out_p = sys.argv[1:7]
+if len(sys.argv) > 7:
+    modeled = set() if sys.argv[7] == '-' else set(sys.argv[7].split(','))
+else:
+    modeled = set(group_names)
 
 GROUPS = [
     ('SINE/Alu', {'SINE/Alu'}),
@@ -248,7 +252,11 @@ for gname in group_names:
     path = group_paths[gname]
     rows = load_group_file(path, tr_m)
     print(f"\nGroup {gname}: {len(rows):,} train rows")
-    floor = 0.50 if gname == 'Ancient' else 0.85
+    if gname not in modeled:
+        print(f"  {gname}: not in modeled set; using fallback thresholds")
+        models[gname] = None
+        continue
+    floor = 0.85 if gname == 'Ancient' else 0.85
     m = train_group(gname, rows)
     if m:
         tau, P, R = pick_tau(m, tr_m, tr_tot, floor=floor)
@@ -258,14 +266,42 @@ for gname in group_names:
     else:
         models[gname] = None
 
-# Fallback per-consensus thresholds
-threshold_path = '/mnt/c/krep_work/model_hybrid_pass2f_thresholds.tsv'
+# Per-group fallback per-consensus thresholds. For modeled groups we keep a
+# permissive floor so the group logistic can decide; for fallback groups we
+# learn a real floor.
+def group_threshold(rows, min_score=15):
+    by_cons = defaultdict(list)
+    for r in rows:
+        by_cons[r[0]].append((int(r[7][0]), r[6]))  # score, y
+    thr = {}
+    for c, vals in by_cons.items():
+        vals = sorted(vals, key=lambda x: -x[0])
+        best_t = min_score
+        best_net = -1e18
+        net = 0
+        i = 0
+        while i < len(vals):
+            t = vals[i][0]
+            j = i
+            while j < len(vals) and vals[j][0] == t:
+                net += (1 if vals[j][1] else -1)
+                j += 1
+            if net > best_net:
+                best_net = net; best_t = t
+            i = j
+        thr[c] = max(min_score, best_t)
+    return thr
+
 fallback_thr = {}
-for l in open(threshold_path):
-    f = l.rstrip('\n').split('\t')
-    if len(f) >= 2:
-        try: fallback_thr[f[0]] = int(f[1])
-        except ValueError: pass
+for gname in group_names:
+    path = group_paths[gname]
+    rows = load_group_file(path, tr_m)
+    thr = group_threshold(rows)
+    fallback_thr.update(thr)
+
+# Ensure every consensus has some threshold
+for c, gr in cons_to_group.items():
+    fallback_thr.setdefault(c, 15)
 
 # Write combined family model file (format consumed by krep align.rs)
 with open(out_p, 'w') as f:
@@ -289,6 +325,15 @@ with open(out_p, 'w') as f:
     for c in sorted(fallback_thr.keys()):
         f.write(f"{c}\t{fallback_thr[c]}\n")
 print("model written to", out_p)
+
+# Also write a plain per-consensus threshold file (no logistic) for direct use.
+thr_out = out_p.replace('.tsv', '_thresholds.tsv')
+if not thr_out.endswith('.tsv'):
+    thr_out = out_p + '_thresholds'
+with open(thr_out, 'w') as f:
+    for c in sorted(fallback_thr.keys()):
+        f.write(f"{c}\t{fallback_thr[c]}\n")
+print("thresholds written to", thr_out)
 
 # Offline evaluation: stream test file
 def evaluate(test_path, merged, total_bases, use_family):
