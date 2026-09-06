@@ -91,24 +91,55 @@ pub struct Library {
 /// accept when p >= tau. Features, in order: score, ln(length),
 /// score/length, consensus coverage, GC, gate sum, gate min, ln(consensus
 /// length); `mu`/`sd` standardize them as at training time.
+///
+/// The family-model variant keeps one model per group and a `group_id` map
+/// from consensus index to group, so each family can have its own decision
+/// boundary instead of a single global tau.
 #[derive(Clone, Debug)]
 pub struct Logistic {
-    pub w: [f64; 8],
-    pub b0: f64,
-    pub tau: f64,
-    pub mu: [f64; 8],
-    pub sd: [f64; 8],
-    pub offsets: Vec<f64>,
+    pub w: Vec<[f64; 8]>,
+    pub b0: Vec<f64>,
+    pub tau: Vec<f64>,
+    pub mu: Vec<[f64; 8]>,
+    pub sd: Vec<[f64; 8]>,
+    /// Per-group per-consensus offsets.
+    pub offsets: Vec<Vec<f64>>,
+    /// Consensus index -> group index.
+    pub group_id: Vec<usize>,
+    /// True if the group has a trained logistic (false for fallback groups
+    /// that rely on per-consensus thresholds).
+    pub has_model: Vec<bool>,
 }
 
 impl Logistic {
+    /// Single global model for backwards compatibility.
+    pub fn global(w: [f64; 8], b0: f64, tau: f64, mu: [f64; 8], sd: [f64; 8], offsets: Vec<f64>) -> Self {
+        let n = offsets.len();
+        Self {
+            w: vec![w],
+            b0: vec![b0],
+            tau: vec![tau],
+            mu: vec![mu],
+            sd: vec![sd],
+            offsets: vec![offsets],
+            group_id: vec![0; n],
+            has_model: vec![true],
+        }
+    }
+
     #[inline]
     fn prob(&self, cid: usize, x: [f64; 8]) -> f64 {
-        let mut z = self.b0 + self.offsets.get(cid).copied().unwrap_or(0.0);
+        let g = self.group_id[cid];
+        let mut z = self.b0[g] + self.offsets[g].get(cid).copied().unwrap_or(0.0);
         for j in 0..8 {
-            z += self.w[j] * (x[j] - self.mu[j]) / self.sd[j];
+            z += self.w[g][j] * (x[j] - self.mu[g][j]) / self.sd[g][j];
         }
         1.0 / (1.0 + (-z.clamp(-30.0, 30.0)).exp())
+    }
+
+    #[inline]
+    pub fn active_for(&self, cid: usize) -> bool {
+        self.has_model[self.group_id[cid]]
     }
 }
 
@@ -228,17 +259,27 @@ impl Library {
         })
     }
 
-    /// Load a learned model. Either per-consensus minimum scores
-    /// (`name<TAB>min_score`) or a logistic model (`#logistic`, `#mu`, `#sd`
-    /// header lines followed by `name<TAB>offset`). Consensi absent from a
-    /// threshold file keep `min_score`.
+    /// Load a learned model. Supported formats:
+    /// 1. Per-consensus minimum scores (`name<TAB>min_score`).
+    /// 2. Global logistic (`#logistic` header with 8 weights+b0+tau, then
+    ///    `#mu`, `#sd`, and `name<TAB>offset`).
+    /// 3. Per-family logistic (`#family_models<TAB>n` with per-group
+    ///    `#group`, `#logistic`, `#mu`, `#sd`, `name<TAB>offset`, and a final
+    ///    `#fallback_thresholds` section of `name<TAB>min_score`).
     pub fn load_thresholds(&mut self, path: &Path) -> io::Result<usize> {
         use std::collections::HashMap;
         let text = std::fs::read_to_string(path)?;
+
+        // Helper to parse tab-separated floats after the first column.
+        let nums = |l: &str| -> Vec<f64> { l.split('\t').skip(1).filter_map(|v| v.trim().parse().ok()).collect() };
+
+        if text.starts_with("#family_models") {
+            return self.load_family_model(&text, nums);
+        }
+
         if text.starts_with("#logistic") {
             let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
             let mut lines = text.lines();
-            let nums = |l: &str| -> Vec<f64> { l.split('\t').skip(1).filter_map(|v| v.trim().parse().ok()).collect() };
             let head = nums(lines.next().ok_or_else(|| bad("empty model"))?);
             if head.len() != 10 { return Err(bad("#logistic needs 8 weights, b0, tau")); }
             let mu = nums(lines.next().ok_or_else(|| bad("missing #mu"))?);
@@ -250,12 +291,11 @@ impl Library {
             let mut w = [0.0; 8]; w.copy_from_slice(&head[..8]);
             let mut m = [0.0; 8]; m.copy_from_slice(&mu);
             let mut d = [0.0; 8]; d.copy_from_slice(&sd);
-            self.logistic = Some(Logistic {
-                w, b0: head[8], tau: head[9], mu: m, sd: d,
-                offsets: self.names.iter().map(|n| *by_name.get(n.as_str()).unwrap_or(&0.0)).collect(),
-            });
+            let offsets = self.names.iter().map(|n| *by_name.get(n.as_str()).unwrap_or(&0.0)).collect();
+            self.logistic = Some(Logistic::global(w, head[8], head[9], m, d, offsets));
             return Ok(by_name.len());
         }
+
         let by_name: HashMap<&str, i32> = text
             .lines()
             .filter_map(|l| {
@@ -271,6 +311,114 @@ impl Library {
             .map(|n| *by_name.get(n.as_str()).unwrap_or(&self.min_score))
             .collect();
         Ok(by_name.len())
+    }
+
+    fn load_family_model(&mut self, text: &str, nums: impl Fn(&str) -> Vec<f64>,
+    ) -> io::Result<usize> {
+        use std::collections::HashMap;
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        let mut lines = text.lines().peekable();
+        let header = nums(lines.next().ok_or_else(|| bad("empty family model"))?);
+        let n_groups = header.first().copied().unwrap_or(0.0) as usize;
+        if n_groups == 0 { return Err(bad("#family_models needs group count")); }
+
+        // name -> (group_index, offset); separate fallback thresholds.
+        let mut assignments: HashMap<&str, (usize, f64)> = HashMap::new();
+        let mut fallback: HashMap<&str, i32> = HashMap::new();
+        let mut group_names: Vec<String> = Vec::new();
+        let mut group_cons: Vec<Vec<String>> = Vec::new();
+        let mut w = Vec::with_capacity(n_groups);
+        let mut b0 = Vec::with_capacity(n_groups);
+        let mut tau = Vec::with_capacity(n_groups);
+        let mut mu = Vec::with_capacity(n_groups);
+        let mut sd = Vec::with_capacity(n_groups);
+        let mut has_model = Vec::with_capacity(n_groups);
+
+        while let Some(line) = lines.next() {
+            if line.is_empty() { continue; }
+            if line.starts_with("#fallback_thresholds") {
+                for l in lines.by_ref() {
+                    if l.is_empty() { continue; }
+                    let mut f = l.split('\t');
+                    let name = f.next().ok_or_else(|| bad("bad fallback line"))?;
+                    let t: i32 = f.next().and_then(|v| v.trim().parse().ok())
+                        .ok_or_else(|| bad("bad fallback threshold"))?;
+                    fallback.insert(name, t);
+                }
+                break;
+            }
+            if !line.starts_with("#group") { continue; }
+            let mut f = line.split('\t').skip(1);
+            let gname = f.next().ok_or_else(|| bad("#group missing name"))?;
+            let cons_or_fallback = f.next().ok_or_else(|| bad("#group missing count"))?;
+            group_names.push(gname.to_string());
+            let gid = group_names.len() - 1;
+            group_cons.push(Vec::new());
+
+            let is_fallback = cons_or_fallback == "fallback";
+            if is_fallback {
+                has_model.push(false);
+                w.push([0.0; 8]); b0.push(0.0); tau.push(0.0); mu.push([0.0; 8]); sd.push([0.0; 8]);
+                // Consume all name<TAB>offset lines until next section.
+                while let Some(&l) = lines.peek() {
+                    if l.starts_with('#') { break; }
+                    lines.next();
+                    let mut ff = l.split('\t');
+                    let name = ff.next().ok_or_else(|| bad("bad fallback consensus line"))?;
+                    group_cons[gid].push(name.to_string());
+                    assignments.insert(name, (gid, 0.0));
+                }
+            } else {
+                let _n_cons: usize = cons_or_fallback.parse().map_err(|_| bad("bad #group count"))?;
+                let wv = nums(lines.next().ok_or_else(|| bad("missing #logistic"))?);
+                if wv.len() != 9 { return Err(bad("#logistic needs 8 weights and b0")); }
+                let mut ww = [0.0; 8]; ww.copy_from_slice(&wv[..8]);
+                w.push(ww); b0.push(wv[8]);
+                let mv = nums(lines.next().ok_or_else(|| bad("missing #mu"))?);
+                let sv = nums(lines.next().ok_or_else(|| bad("missing #sd"))?);
+                if mv.len() != 8 || sv.len() != 8 { return Err(bad("#mu/#sd need 8 values")); }
+                let mut mm = [0.0; 8]; mm.copy_from_slice(&mv);
+                let mut dd = [0.0; 8]; dd.copy_from_slice(&sv);
+                mu.push(mm); sd.push(dd);
+                let t: f64 = f.next().and_then(|v| v.trim().parse().ok())
+                    .ok_or_else(|| bad("missing group tau"))?;
+                tau.push(t);
+                has_model.push(true);
+
+                while let Some(&l) = lines.peek() {
+                    if l.starts_with('#') { break; }
+                    lines.next();
+                    let mut ff = l.split('\t');
+                    let name = ff.next().ok_or_else(|| bad("bad consensus line"))?;
+                    let off: f64 = ff.next().and_then(|v| v.trim().parse().ok())
+                        .ok_or_else(|| bad("bad consensus offset"))?;
+                    group_cons[gid].push(name.to_string());
+                    assignments.insert(name, (gid, off));
+                }
+            }
+        }
+
+        let n = self.names.len();
+        let mut group_id = vec![n_groups; n]; // default to last group if unassigned
+        let mut offsets = vec![vec![0.0; n]; n_groups];
+        for (i, name) in self.names.iter().enumerate() {
+            if let Some(&(gid, off)) = assignments.get(name.as_str()) {
+                group_id[i] = gid;
+                offsets[gid][i] = off;
+            } else {
+                // Unknown consensus: put in first fallback group (usually Other).
+                if let Some(gid) = has_model.iter().position(|&h| !h) {
+                    group_id[i] = gid;
+                }
+            }
+        }
+        self.logistic = Some(Logistic { w, b0, tau, mu, sd, offsets, group_id, has_model });
+
+        // Fallback thresholds apply to every consensus, overriding min_score.
+        if !fallback.is_empty() {
+            self.thresholds = self.names.iter().map(|n| *fallback.get(n.as_str()).unwrap_or(&self.min_score)).collect();
+        }
+        Ok(assignments.len() + fallback.len())
     }
 
     #[inline]
@@ -560,21 +708,24 @@ impl Library {
         if self.accept(oi / 2, total) && gf + gb >= 30 {
             let (gl, gr) = self.gate_sides(seq, oi, cpos, gpos);
             if let Some(m) = &self.logistic {
-                let (start, end) = (gpos - gb, gpos + gf);
-                let len = (end - start) as f64;
-                let gc = seq[start..end].iter().filter(|&&b| b == b'G' || b == b'C').count() as f64 / len;
-                let x = [
-                    total as f64,
-                    len.ln(),
-                    total as f64 / len,
-                    (cf + cb) as f64 / cons.len().max(1) as f64,
-                    gc,
-                    (gl + gr) as f64,
-                    gl.min(gr) as f64,
-                    (cons.len() as f64).ln(),
-                ];
-                if m.prob(oi / 2, x) < m.tau {
-                    return None;
+                let cid = oi / 2;
+                if m.active_for(cid) {
+                    let (start, end) = (gpos - gb, gpos + gf);
+                    let len = (end - start) as f64;
+                    let gc = seq[start..end].iter().filter(|&&b| b == b'G' || b == b'C').count() as f64 / len;
+                    let x = [
+                        total as f64,
+                        len.ln(),
+                        total as f64 / len,
+                        (cf + cb) as f64 / cons.len().max(1) as f64,
+                        gc,
+                        (gl + gr) as f64,
+                        gl.min(gr) as f64,
+                        (cons.len() as f64).ln(),
+                    ];
+                    if m.prob(cid, x) < m.tau[m.group_id[cid]] {
+                        return None;
+                    }
                 }
             }
             Some(Candidate {

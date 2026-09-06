@@ -14,7 +14,9 @@ A repeat masker for T2T-CHM13 that works in three layers, all in
    strands, banded X-drop extension. Consensi come from `krep consensus`
    (de novo, RepeatScout-style) or from Dfam. `--lib-single-hit` with
    `--lib-gate=-4,2` is the sensitive mode; `--lib-model` applies a learned
-   per-consensus filter.
+   per-consensus filter. The filter now supports **per-family-group models**
+   (`scripts/train_family_models.py`, `src/align.rs`) so that each broad
+   repeat class can have its own decision boundary.
 3. **Tandem + DUST** (`--tandem`, `--dust`): the TRF/DUST half of an
    NCBI-style mask.
 4. **Profile-HMM layer** (`--hmm-bed`): merge pre-computed HMM hits (e.g.
@@ -54,6 +56,46 @@ Per family (hybrid → hybrid + logistic filter), genome-wide recall:
 
 The remaining gap is the oldest families (L2, MIR, CR1): short fragments at
 ~65% identity. Everything younger is at 0.75–0.99.
+
+## Per-family-group model (de novo library, chr1)
+
+A single global logistic maximizes overall F1 and tends to discard the weak
+signal from ancient/rare families. `scripts/train_family_models.py` assigns
+each consensus to a family group, trains one logistic model per group with a
+group-specific tau, and writes a combined `--lib-model` file. With the plain
+de-novo `chm13_consensi_sp16_pool1M_pass2f.fa` library this gives a small
+precision gain but no rare-family recall lift (the library simply lacks
+CR1/Helitron consensi).
+
+Adding 29 rare Dfam consensi (CR1, Helitron, MIR, L2, Tip100) to the library
+and retraining the per-group model closes much of the gap on chr1:
+
+| chr1 config | P | R | F1 |
+|---|---|---|---|
+| de novo + global logistic | 0.9320 | 0.7649 | 0.8402 |
+| de novo + per-family model | 0.9394 | 0.7624 | 0.8417 |
+| de novo+Dfam rare + per-family model | 0.9327 | 0.7849 | **0.8524** |
+| de novo+Dfam rare + per-family + k18/tandem/dust | 0.9230 | 0.7913 | **0.8521** |
+
+Per-family recall (rare families) with the augmented library:
+
+| family | recall |
+|---|---|
+| SINE/Alu | 0.9891 |
+| LINE/L1 | 0.8363 |
+| LTR/ERVK | 0.8935 |
+| LTR/ERV1 | 0.6981 |
+| LTR/ERVL-MaLR | 0.7238 |
+| LTR/ERVL | 0.4731 |
+| DNA/hAT-Tip100 | 0.1590 |
+| SINE/MIR | 0.5444 |
+| LINE/L2 | 0.4534 |
+| LINE/CR1 | 0.1064 |
+| RC/Helitron | 0.6803 |
+
+Files: `chm13_consensi_sp16_pool1M_pass2f_rare.fa`,
+`model_family_groups_pass2f_rare.tsv`,
+`consensus_family_labels_pass2f_rare.tsv`.
 
 ## Exact final command
 
