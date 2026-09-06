@@ -690,10 +690,30 @@ with the k18 index + tandem + dust on chr1 (no learned filter yet):
 | pass2f + k18@32 + tandem + dust (raw) | 0.7293 | **0.8419** | 0.7816 | 0.4381 | 0.3264 | 0.4817 | 0.5802 |
 
 The raw hybrid reaches **84.2% recall** and excellent ancient-family recall,
-but precision is only 0.73 because the unfiltered library over-masks. A
-learned hit filter trained on chr2–4 candidates from this exact hybrid
-configuration is the next step; it should recover most of the lost precision
-while keeping much of the recall gain.
+but precision is only 0.73 because the unfiltered library over-masks.
+
+A learned hit filter trained on chr2–4 candidates from this exact hybrid
+configuration was then applied to chr1:
+
+| filter | P | R | F1 | Tip100 | CR1 | L2 | MIR |
+|---|---|---|---|---|---|---|---|
+| raw (no filter) | 0.7293 | 0.8419 | 0.7816 | 0.4381 | 0.3264 | 0.4817 | 0.5802 |
+| main logistic | 0.9541 | 0.7379 | **0.8322** | 0.1252 | 0.0181 | 0.2253 | 0.4173 |
+| main + rare | 0.9421 | 0.7408 | 0.8294 | 0.1325 | 0.0236 | 0.2390 | 0.4243 |
+
+The logistic filter recovers precision to 0.95+ but **kills most of the
+ancient-family recall gain**. The final hybrid result is only marginally
+better than the de novo library alone (F1 0.8322 vs 0.8319) and still far
+from the Dfam hybrid (F1 ~0.91). The rare specialist adds small gains for
+CR1/L2/MIR at a 1.2-point precision cost.
+
+Conclusion: **the post-hoc filter is the bottleneck, not the consensus
+builder.** The raw hybrid output contains the ancient-family signal, but the
+logistic model is trained to maximize overall F1 and discards the
+low-precision hits that carry that signal. A more targeted filtering strategy
+(per-family thresholds, or a model that optimizes recall on rare families at
+a fixed precision budget) would be needed to turn the raw hybrid recall into
+real gains.
 
 ## What would still move it
 
