@@ -89,11 +89,43 @@ Per-family recall (rare families) with the augmented library:
 | LINE/CR1 | 0.1710 | 0.3002 |
 | RC/Helitron | 0.6813 | 0.7304 |
 
-Files: `chm13_consensi_sp16_pool1M_pass2f_rare.fa`,
-`model_family_groups_pass2f_rare_scorethr_thresholds.tsv` (score-based
-per-consensus thresholds),
-`model_family_groups_pass2f_rare.tsv` (full per-family model),
-`consensus_family_labels_pass2f_rare.tsv`.
+### Fragment library pass (lower-weight seed, chr1)
+
+The rare-family gap is a sensitivity problem, not a consensus-count problem.
+A second, optional library pass with a lower-weight spaced seed
+(`11011011011011`, weight 10, span 14), single-hit mode, and a permissive
+score gate (`-6,0`) rescues additional short ancient fragments without the
+precision loss of the full per-family model. The pass is restricted to a
+small "Ancient" consensus set (`ancient_rare.fa`, 95 consensi extracted
+from the rare-augmented library). Per-consensus thresholds for the fragment
+pass are trained with `train_frag_thresholds.py` on chr1–3 candidate dumps
+and applied via `--lib-frag-model`.
+
+| chr1 config (library-only, single-hit −4,2) | P | R | F1 |
+|---|---|---|---|
+| de novo+Dfam rare + per-consensus thresholds (score) | 0.9377 | 0.7844 | **0.8542** |
+| + fragment pass, default score floor 8 | 0.9328 | 0.7929 | 0.8572 |
+| + fragment pass, trained per-consensus thresholds | **0.9354** | **0.7921** | **0.8578** |
+
+Per-family recall with the fragment pass (trained thresholds):
+
+| family | baseline | + fragment pass |
+|---|---|---|
+| DNA/hAT-Tip100 | 0.2943 | 0.2960 |
+| SINE/MIR | 0.5833 | 0.6327 |
+| LINE/L2 | 0.5051 | 0.5471 |
+| LINE/CR1 | 0.1710 | 0.1906 |
+| RC/Helitron | 0.6813 | 0.7080 |
+
+The fragment pass adds ~1.9 Mbp of true repeat bases on chr1 for a modest
+precision drop (−0.23 pp), lifting overall F1 from 0.8542 to 0.8578. The
+biggest absolute gains are in MIR (+455 kbp), L2 (+500 kbp), and CR1
+(+223 kbp). Tip100 remains largely unchanged because the sensitive main
+library already covers most recoverable instances.
+
+Files: `ancient_rare.fa`, `frag_thresholds.tsv`,
+`chr{1,2,3,4}_frag_cand.tsv`, `chr{1,2,3,4}_frag_test.bed`,
+`chr1_frag_thr_test.bed`. Script: `C:\krep_work\train_frag_thresholds.py`.
 
 ## Exact final command
 

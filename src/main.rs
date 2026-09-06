@@ -242,6 +242,52 @@ enum Commands {
         #[arg(long, value_name = "TSV")]
         lib_model: Option<PathBuf>,
 
+        /// Optional second, more sensitive consensus library for short/diverged
+        /// repeat fragments (e.g. ancient/rare families). Runs as a separate
+        /// alignment pass with its own seed/gate/model and is merged into the
+        /// main mask.
+        #[arg(long, value_name = "FASTA")]
+        library_frag: Option<PathBuf>,
+
+        /// Minimum alignment score (match +1, mismatch -1, gap -3) for fragment-library hits.
+        #[arg(long, default_value_t = 8)]
+        lib_frag_min_score: i32,
+
+        /// Minimum reported length for a fragment-library hit.
+        #[arg(long, default_value_t = 50)]
+        lib_frag_min_len: usize,
+
+        /// Band half-width for fragment-library X-drop extension.
+        #[arg(long, default_value_t = 16)]
+        lib_frag_band: usize,
+
+        /// X-drop for fragment-library extension.
+        #[arg(long, default_value_t = 30)]
+        lib_frag_xdrop: i32,
+
+        /// Spaced seed for fragment-library hits. Lower weight is more sensitive
+        /// to diverged fragments. Default weight-10 span-14 pattern.
+        #[arg(long, default_value = "11011011011011")]
+        lib_frag_seed: String,
+
+        /// Trigger single-hit mode for the fragment library. Short ancient
+        /// fragments do not chain reliably, so this is on by default.
+        #[arg(long, default_value_t = true)]
+        lib_frag_single_hit: bool,
+
+        /// Fragment-library single-hit gate thresholds "SUM,SIDE".
+        /// More lenient than the main library gate because fragments are short.
+        #[arg(long, value_delimiter = ',', default_value = "-6,0")]
+        lib_frag_gate: Vec<i32>,
+
+        /// Per-consensus or per-family model for fragment-library hits.
+        #[arg(long, value_name = "TSV")]
+        lib_frag_model: Option<PathBuf>,
+
+        /// Dump accepted fragment-library hits to TSV for training --lib-frag-model.
+        #[arg(long, value_name = "TSV")]
+        lib_frag_dump: Option<PathBuf>,
+
         /// Also detect tandem repeats (Tandem Repeats Finder-style): k-mer
         /// recurrence at a fixed period, verified by periodic self-identity.
         /// Supplies the TRF half of an NCBI-style mask and lifts
@@ -643,6 +689,16 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
         lib_dump,
         lib_subst_dump,
         lib_model,
+        library_frag,
+        lib_frag_min_score,
+        lib_frag_min_len,
+        lib_frag_band,
+        lib_frag_xdrop,
+        lib_frag_seed,
+        lib_frag_single_hit,
+        lib_frag_gate,
+        lib_frag_model,
+        lib_frag_dump,
         hmm_bed,
         tandem,
         tandem_max_period,
@@ -659,7 +715,7 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Streaming path: genome-wide index lookups and/or library alignment.
-    if !index_paths.is_empty() || library.is_some() || *tandem || *dust {
+    if !index_paths.is_empty() || library.is_some() || library_frag.is_some() || *tandem || *dust {
         let tandem_params = if *tandem {
             Some(tandem::TandemParams {
                 k: (*tandem_k).clamp(4, 8),
@@ -699,6 +755,22 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             }
             None => None,
         };
+        let lib_frag = match library_frag {
+            Some(p) => {
+                let mut l = align::Library::load_with_seed(p, lib_frag_seed, *lib_frag_min_score, *lib_frag_band, *lib_frag_xdrop)?;
+                l.single_hit = *lib_frag_single_hit;
+                if lib_frag_gate.len() == 2 {
+                    l.gate_sum = lib_frag_gate[0];
+                    l.gate_side = lib_frag_gate[1];
+                }
+                if let Some(m) = lib_frag_model {
+                    let n = l.load_thresholds(m)?;
+                    println!("Loaded fragment thresholds for {} consensi from {}", n, m.display());
+                }
+                Some(l)
+            }
+            None => None,
+        };
         let highs = if index_paths.is_empty() { Vec::new() } else { broadcast(index_threshold, "--index-threshold")? };
         let lows = match index_threshold_low {
             Some(v) if !index_paths.is_empty() => broadcast(v, "--index-threshold-low")?,
@@ -714,10 +786,13 @@ fn run_mask(args: &Commands) -> Result<(), Box<dyn std::error::Error>> {
             *min_hits,
             *min_density,
             lib.as_ref(),
+            lib_frag.as_ref(),
+            *lib_frag_min_len,
             tandem_params,
             if *dust { Some((*dust_window, *dust_threshold)) } else { None },
             lib_dump.as_deref(),
             lib_subst_dump.as_deref(),
+            lib_frag_dump.as_deref(),
             hmm_bed.as_deref(),
             out,
             out_format,
@@ -1205,10 +1280,13 @@ fn run_mask_indexed(
     min_hits: usize,
     min_density: f64,
     library: Option<&align::Library>,
+    library_frag: Option<&align::Library>,
+    lib_frag_min_len: usize,
     tandem_params: Option<tandem::TandemParams>,
     dust: Option<(usize, f64)>,
     lib_dump: Option<&std::path::Path>,
     lib_subst_dump: Option<&std::path::Path>,
+    lib_frag_dump: Option<&std::path::Path>,
     hmm_bed: Option<&std::path::Path>,
     out: &PathBuf,
     out_format: &OutputFormat,
@@ -1269,8 +1347,30 @@ fn run_mask_indexed(
             lib.xdrop
         );
     }
+    if let Some(lib) = library_frag {
+        println!(
+            "Loaded fragment library: {} consensi, {} bp, {} seeded positions; min score {}, band {}, x-drop {}, seed {}, single-hit {}",
+            lib.len(),
+            lib.total_bases(),
+            lib.seeded_positions(),
+            lib.min_score,
+            lib.band,
+            lib.xdrop,
+            lib.seed.pattern(),
+            lib.single_hit
+        );
+    }
 
     let mut dump_writer = match lib_dump {
+        Some(p) => {
+            use std::io::Write as _;
+            let mut w = std::io::BufWriter::new(fs::File::create(p)?);
+            writeln!(w, "chrom\tstart\tend\tconsensus\tstrand\tscore\tscore_fwd\tscore_bwd\tcons_fwd\tcons_bwd\tcons_len\tgate_left\tgate_right\tgc")?;
+            Some(w)
+        }
+        None => None,
+    };
+    let mut frag_dump_writer = match lib_frag_dump {
         Some(p) => {
             use std::io::Write as _;
             let mut w = std::io::BufWriter::new(fs::File::create(p)?);
@@ -1360,6 +1460,29 @@ fn run_mask_indexed(
             regions.extend(lib_regions);
             align::merge_regions(&mut regions);
         }
+        if let Some(lib) = library_frag {
+            let (mut frag_regions, frag_cands) = lib.mask_record_with_candidates(&rec.header, &rec.seq);
+            // Filter fragment regions by min length.
+            frag_regions.retain(|r| r.end - r.start >= lib_frag_min_len);
+            let id = fasta::seq_id(&rec.header);
+            if let Some(w) = frag_dump_writer.as_mut() {
+                use std::io::Write as _;
+                for c in &frag_cands {
+                    let win = &rec.seq[c.start..c.end];
+                    let gc = win.iter().filter(|&&b| b == b'G' || b == b'C').count() as f64
+                        / win.len().max(1) as f64;
+                    writeln!(
+                        w,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+                        id, c.start, c.end, lib.names[c.cid], if c.strand { '+' } else { '-' },
+                        c.score, c.score_fwd, c.score_bwd, c.cons_fwd, c.cons_bwd, c.cons_len,
+                        c.gate_left, c.gate_right, gc
+                    )?;
+                }
+            }
+            regions.extend(frag_regions);
+            align::merge_regions(&mut regions);
+        }
         if let Some(tp) = tandem_params {
             regions.extend(tandem::find_tandems(&rec.header, &rec.seq, &tp));
             align::merge_regions(&mut regions);
@@ -1395,6 +1518,10 @@ fn run_mask_indexed(
         w.finish()?;
     }
     if let Some(mut w) = dump_writer {
+        use std::io::Write as _;
+        w.flush()?;
+    }
+    if let Some(mut w) = frag_dump_writer {
         use std::io::Write as _;
         w.flush()?;
     }

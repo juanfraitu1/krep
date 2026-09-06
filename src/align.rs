@@ -61,7 +61,7 @@ pub struct Library {
     /// Oriented consensi: index 2c is consensus c forward, 2c+1 its reverse
     /// complement.
     seqs: Vec<Vec<u8>>,
-    seed: SpacedSeed,
+    pub seed: SpacedSeed,
     span: usize,
     /// `entries[table[v]..table[v+1]]` are the library positions with seed
     /// value `v`.
@@ -85,6 +85,9 @@ pub struct Library {
     /// Optional logistic filter over hit features with a per-consensus
     /// offset (see `train_logistic.py`).
     pub logistic: Option<Logistic>,
+    /// Minimum length to keep a fragment-library hit; shorter hits are filtered
+    /// by the caller after `mask_record_with_candidates`.
+    pub frag_min_len: usize,
 }
 
 /// Logistic hit filter: p = sigmoid(b0 + offset[cid] + w . z(features)),
@@ -256,6 +259,7 @@ impl Library {
             gate_side: 6,
             thresholds: Vec::new(),
             logistic: None,
+            frag_min_len: 0,
         })
     }
 
